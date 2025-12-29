@@ -1,0 +1,40 @@
+dist
+.ai-cache/
+
+# Testing
+coverage
+test-results
+
+# AI Tooling - Local Configuration
+CLAUDE.local.md
+
+# Claude Code - Ignore local files but keep shared config
+.claude/*
+!.claude/agents/
+!.claude/commands/
+!.claude/skills/
+!.claude/hooks/
+
+# Other AI Tools
+.cursor/
+.continue/
+.aider*
+.cody/
+.playwright-mcp/
+
+# IDE - Local Configuration
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.classpath
+.settings/
+*.sublime-workspace
+*.sublime-project
