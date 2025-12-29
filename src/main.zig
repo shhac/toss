@@ -70,6 +70,7 @@ const ArgParseError = error{
 fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseError!Config {
     var config = Config{};
     var dice_list: std.ArrayList([]const u8) = .{};
+    defer dice_list.deinit(allocator);
 
     var i: usize = 1; // Skip program name
     while (i < args.len) : (i += 1) {
