@@ -13,11 +13,21 @@ pub const MAX_EXPLOSIONS = 100;
 /// Maximum number of rerolls per die (prevents infinite loops)
 pub const MAX_REROLLS_PER_DIE = 100;
 
+/// Maximum number of reroll history entries to track (for display purposes)
+pub const MAX_REROLL_HISTORY = 10;
+
 /// Result of a single die roll
 pub const DieResult = struct {
     value: u32,
     kept: bool, // false if dropped by modifier
     exploded: bool = false, // true if this die triggered an explosion
+    // Reroll history (bounded array for display)
+    _reroll_history: [MAX_REROLL_HISTORY]u32 = undefined,
+    _reroll_count: u8 = 0,
+
+    pub fn rerollHistory(self: *const DieResult) []const u32 {
+        return self._reroll_history[0..self._reroll_count];
+    }
 };
 
 /// Result of evaluating a dice roll expression (e.g., 4d6k3)
@@ -198,6 +208,11 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
             // Keep rerolling while the condition matches (for continuous reroll)
             // or just once (for reroll once)
             while (shouldReroll(result._dice_buf[i].value, dice.sides, reroll_config) and reroll_count < MAX_REROLLS_PER_DIE) {
+                // Store old value in history (if room)
+                if (result._dice_buf[i]._reroll_count < MAX_REROLL_HISTORY) {
+                    result._dice_buf[i]._reroll_history[result._dice_buf[i]._reroll_count] = result._dice_buf[i].value;
+                    result._dice_buf[i]._reroll_count += 1;
+                }
                 // Roll a new value to replace the current one
                 const new_value: u32 = if (dice.sides == 0) rng.roll(3) else rng.roll(dice.sides);
                 result._dice_buf[i].value = new_value;
@@ -751,4 +766,63 @@ test "evaluate Fudge dice total is sum minus 2 per die" {
         expected_total += @as(i32, @intCast(die.value)) - 2;
     }
     try testing.expectEqual(expected_total, result.total);
+}
+
+// -----------------------------------------------------------------------------
+// Reroll History Tests
+// -----------------------------------------------------------------------------
+
+test "reroll tracks history" {
+    // Find a seed where d6 rolls 1 first (triggering reroll on r1)
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        if (test_rng.roll(6) == 1) break;
+    }
+
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6r1");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls[0].dice_results.len);
+
+    const die = &result.dice_rolls[0].dice_results[0];
+    // Should have at least one reroll in history (the initial 1 that was rerolled)
+    try testing.expect(die._reroll_count > 0);
+    // First history entry should be the rerolled value (1)
+    try testing.expectEqual(@as(u32, 1), die.rerollHistory()[0]);
+    // Final value should NOT be 1 (rerolled away)
+    try testing.expect(die.value != 1);
+}
+
+test "reroll history respects MAX_REROLL_HISTORY cap" {
+    // Test that history is capped at MAX_REROLL_HISTORY
+    // Use a d2 with reroll on 1 - this will reroll until we get 2
+    // With a bad seed this could reroll many times
+    var seed: u64 = 0;
+    var max_rerolls: usize = 0;
+    // Find a seed that causes many rerolls on d2r1
+    while (seed < 10000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        var count: usize = 0;
+        while (test_rng.roll(2) == 1 and count < 20) {
+            count += 1;
+        }
+        if (count > max_rerolls) {
+            max_rerolls = count;
+        }
+        if (count > MAX_REROLL_HISTORY) {
+            break; // Found a seed with many rerolls
+        }
+    }
+
+    // Even if many rerolls happened, history should be capped
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d2r1");
+    const result = try evaluate(expr, &rng);
+
+    const die = &result.dice_rolls[0].dice_results[0];
+    // History count should never exceed MAX_REROLL_HISTORY
+    try testing.expect(die._reroll_count <= MAX_REROLL_HISTORY);
 }

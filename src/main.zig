@@ -16,6 +16,7 @@ const help_text =
     \\Options:
     \\  -s, --seed <NUM>    Seed for reproducible rolls
     \\      --show-seed     Output the seed used to stderr
+    \\      --show-rerolls  Show reroll history (e.g., 1,3 means rolled 1, rerolled to 3)
     \\      --no-labels     Omit the [expr] label prefix
     \\      --result-only   Only show the final total (no individual dice)
     \\  -h, --help          Display this help message
@@ -51,6 +52,7 @@ const help_text =
 const Config = struct {
     seed: ?u64 = null,
     show_seed: bool = false,
+    show_rerolls: bool = false,
     no_labels: bool = false,
     result_only: bool = false,
     help: bool = false,
@@ -81,6 +83,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseErr
             return config;
         } else if (std.mem.eql(u8, arg, "--show-seed")) {
             config.show_seed = true;
+        } else if (std.mem.eql(u8, arg, "--show-rerolls")) {
+            config.show_rerolls = true;
         } else if (std.mem.eql(u8, arg, "--no-labels")) {
             config.no_labels = true;
         } else if (std.mem.eql(u8, arg, "--result-only")) {
@@ -467,6 +471,12 @@ fn run() !void {
                     // Normal die result with color
                     const result_color = group.results[die_index % group.results.len];
                     stdout_tty.setColor(&out.interface, result_color) catch {};
+                    // Show reroll history if enabled and there was a reroll
+                    if (config.show_rerolls and die._reroll_count > 0) {
+                        for (die.rerollHistory()) |hist_val| {
+                            try out.interface.print("{d},", .{hist_val});
+                        }
+                    }
                     if (dice_result.sides == 0) {
                         // Fudge dice: display as -1, 0, +1
                         if (config.no_labels) {
