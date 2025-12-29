@@ -86,6 +86,27 @@ const color_groups = [_]ColorGroup{
     .{ .label = .dim, .results = .{ .blue, .cyan, .bright_blue } },
 };
 
+/// Calculate the number of digits needed to represent a number
+fn digitCount(n: u32) usize {
+    if (n == 0) return 1;
+    var count: usize = 0;
+    var value = n;
+    while (value > 0) : (value /= 10) {
+        count += 1;
+    }
+    return count;
+}
+
+/// Write a right-aligned number with the given width
+fn writeRightAligned(writer: anytype, value: u32, width: usize) !void {
+    const value_width = digitCount(value);
+    // Add leading spaces for alignment
+    for (0..(width -| value_width)) |_| {
+        try writer.print(" ", .{});
+    }
+    try writer.print("{d}", .{value});
+}
+
 fn run() !void {
     // Set up allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -158,8 +179,11 @@ fn run() !void {
         try err.interface.flush();
     }
 
-    // Process each dice spec
-    var row_index: usize = 0;
+    // First pass: parse all dice specs and find max sides value
+    var max_sides: u32 = 0;
+    var parsed_specs: std.ArrayList(dice.DiceSpec) = .{};
+    defer parsed_specs.deinit(allocator);
+
     for (config.dice_specs) |spec_str| {
         const spec = dice.parse(spec_str) catch |parse_err| {
             stderr_tty.setColor(&err.interface, .red) catch {};
@@ -172,23 +196,48 @@ fn run() !void {
                 error.Overflow => try err.interface.print("Number too large in '{s}'\n", .{spec_str}),
             }
             try err.interface.flush();
+            // Store a sentinel value for invalid specs
+            try parsed_specs.append(allocator, .{ .count = 0, .sides = 0 });
             continue;
         };
+
+        if (spec.sides > max_sides) {
+            max_sides = spec.sides;
+        }
+        try parsed_specs.append(allocator, spec);
+    }
+
+    // Calculate the width needed for the max sides value
+    const sides_width = digitCount(max_sides);
+
+    // Second pass: output with padding
+    var row_index: usize = 0;
+    for (config.dice_specs, 0..) |_, spec_index| {
+        const spec = parsed_specs.items[spec_index];
+
+        // Skip invalid specs (already reported error)
+        if (spec.count == 0 and spec.sides == 0) {
+            continue;
+        }
 
         // Get color group for this row (cycles every 3 rows)
         const group = color_groups[row_index % color_groups.len];
 
-        // Print the dice spec label (dim color)
+        // Print the dice spec label with padding (dim color)
+        // Format: [<count>d<padded_sides>]
         stdout_tty.setColor(&out.interface, group.label) catch {};
-        try out.interface.print("[{s}]", .{spec_str});
+        try out.interface.print("[{d}d", .{spec.count});
+        try writeRightAligned(&out.interface, spec.sides, sides_width);
+        try out.interface.print("]", .{});
         stdout_tty.setColor(&out.interface, .reset) catch {};
 
-        // Roll and print each die (alternating colors within group)
+        // Roll and print each die (alternating colors within group) with padding
         for (0..spec.count) |die_index| {
             const result = rng.roll(spec.sides);
             const result_color = group.results[die_index % group.results.len];
             stdout_tty.setColor(&out.interface, result_color) catch {};
-            try out.interface.print(" {d}", .{result});
+            try out.interface.print(" ", .{});
+            try writeRightAligned(&out.interface, result, sides_width);
         }
 
         stdout_tty.setColor(&out.interface, .reset) catch {};
