@@ -3,7 +3,7 @@ const parser = @import("parser.zig");
 const eval = @import("eval.zig");
 const rng_mod = @import("rng.zig");
 
-const version = "0.3.0";
+const version = "0.4.0";
 
 const help_text =
     \\toss - A dice rolling CLI
@@ -32,6 +32,16 @@ const help_text =
     \\  kl<N>               Keep lowest N dice
     \\  d, dl<N>            Drop lowest N dice (e.g., 4d6d1)
     \\  dh<N>               Drop highest N dice
+    \\
+    \\Exploding:
+    \\  !                   Explode on max value (e.g., 1d6!)
+    \\  !!                  Compound explode (adds to same die)
+    \\  !p                  Penetrating explode (-1 per explosion)
+    \\  !>N, !<N, !=N       Explode on threshold (e.g., 1d6!>4)
+    \\
+    \\Reroll:
+    \\  r, r<N>             Reroll on value (default: 1s, e.g., 2d6r1)
+    \\  ro, ro<N>           Reroll once (e.g., 2d6ro<=2)
     \\
     \\Arithmetic:
     \\  +, -, *, /          Combine dice and numbers (e.g., 2d6+5, 1d20+1d4)
@@ -169,8 +179,44 @@ fn formatExprValue(writer: anytype, value: parser.ExprValue) !void {
             } else {
                 try writer.print("{d}", .{dice.sides});
             }
-            if (dice.modifier) |mod| {
-                switch (mod) {
+            // Format explode modifier (!, !!, !p)
+            if (dice.explode) |ex| {
+                switch (ex.explode_type) {
+                    .standard => try writer.writeByte('!'),
+                    .compound => try writer.print("!!", .{}),
+                    .penetrating => try writer.print("!p", .{}),
+                }
+                // Format compare point if present
+                if (ex.compare) |cmp| {
+                    switch (cmp.op) {
+                        .eq => try writer.print("={d}", .{cmp.value}),
+                        .gt => try writer.print(">{d}", .{cmp.value}),
+                        .lt => try writer.print("<{d}", .{cmp.value}),
+                        .gte => try writer.print(">={d}", .{cmp.value}),
+                        .lte => try writer.print("<={d}", .{cmp.value}),
+                    }
+                }
+            }
+            // Format reroll modifier (r, ro)
+            if (dice.reroll) |rr| {
+                if (rr.once) {
+                    try writer.print("ro", .{});
+                } else {
+                    try writer.writeByte('r');
+                }
+                // Format compare point if present
+                if (rr.compare) |cmp| {
+                    switch (cmp.op) {
+                        .eq => try writer.print("{d}", .{cmp.value}),
+                        .gt => try writer.print(">{d}", .{cmp.value}),
+                        .lt => try writer.print("<{d}", .{cmp.value}),
+                        .gte => try writer.print(">={d}", .{cmp.value}),
+                        .lte => try writer.print("<={d}", .{cmp.value}),
+                    }
+                }
+            }
+            if (dice.keep_drop) |kd| {
+                switch (kd) {
                     .keep_highest => |n| try writer.print("k{d}", .{n}),
                     .keep_lowest => |n| try writer.print("kl{d}", .{n}),
                     .drop_highest => |n| try writer.print("dh{d}", .{n}),
@@ -410,10 +456,18 @@ fn run() !void {
                     } else {
                         try writeRightAligned(&out.interface, die.value, sides_width, ' ');
                     }
+                    // Mark exploded dice with * suffix
+                    if (die.exploded) {
+                        try out.interface.print("*", .{});
+                    }
                 } else {
                     // Dropped die - dim with strikethrough styling (~value~)
                     stdout_tty.setColor(&out.interface, .dim) catch {};
                     try out.interface.print("~{d}~", .{die.value});
+                    // Mark dropped exploded dice too
+                    if (die.exploded) {
+                        try out.interface.print("*", .{});
+                    }
                 }
 
                 die_index += 1;

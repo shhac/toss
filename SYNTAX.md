@@ -67,6 +67,10 @@ Roll additional dice when certain values appear.
 
 **Default:** Without a threshold, dice explode on their maximum value.
 
+**Safety limits:**
+- Maximum 100 extra dice from explosions (prevents infinite loops)
+- d1 and dF (Fudge dice) cannot explode (would always trigger)
+
 ### Reroll
 
 Re-roll dice that meet certain conditions.

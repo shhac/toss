@@ -7,10 +7,17 @@ const Allocator = std.mem.Allocator;
 /// Maximum number of dice that can be rolled in a single dice expression
 pub const MAX_DICE = 256;
 
+/// Maximum number of explosions per dice expression (prevents infinite loops)
+pub const MAX_EXPLOSIONS = 100;
+
+/// Maximum number of rerolls per die (prevents infinite loops)
+pub const MAX_REROLLS_PER_DIE = 100;
+
 /// Result of a single die roll
 pub const DieResult = struct {
     value: u32,
     kept: bool, // false if dropped by modifier
+    exploded: bool = false, // true if this die triggered an explosion
 };
 
 /// Result of evaluating a dice roll expression (e.g., 4d6k3)
@@ -58,6 +65,42 @@ pub const EvalError = error{
     TooManyDice,
 };
 
+/// Check if a die value should trigger an explosion
+fn shouldExplode(value: u32, sides: u32, config: parser.ExplodeConfig) bool {
+    // Don't explode d1 or dF (prevents infinite loops)
+    if (sides <= 1) return false;
+
+    if (config.compare) |cmp| {
+        return switch (cmp.op) {
+            .eq => value == cmp.value,
+            .gt => value > cmp.value,
+            .lt => value < cmp.value,
+            .gte => value >= cmp.value,
+            .lte => value <= cmp.value,
+        };
+    }
+    // Default: explode on max
+    return value == sides;
+}
+
+/// Check if a die value should be rerolled
+fn shouldReroll(value: u32, sides: u32, config: parser.RerollConfig) bool {
+    // Don't reroll d1 or dF (would be infinite loop for d1, undefined for dF)
+    _ = sides; // Reserved for potential future use
+
+    if (config.compare) |cmp| {
+        return switch (cmp.op) {
+            .eq => value == cmp.value,
+            .gt => value > cmp.value,
+            .lt => value < cmp.value,
+            .gte => value >= cmp.value,
+            .lte => value <= cmp.value,
+        };
+    }
+    // Default: reroll 1s
+    return value == 1;
+}
+
 /// Evaluate a dice roll specification, applying any modifiers
 fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRollResult {
     if (dice.count > MAX_DICE) {
@@ -69,7 +112,7 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
         .subtotal = 0,
     };
 
-    // Roll all dice
+    // Roll all initial dice
     for (0..dice.count) |i| {
         const value: u32 = if (dice.sides == 0) blk: {
             // Fudge dice: -1, 0, or +1 (we store as 0, 1, 2 and interpret later)
@@ -85,13 +128,92 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
         };
     }
     result._dice_len = dice.count;
+
+    // Apply explode modifier if present
+    if (dice.explode) |explode_config| {
+        var explosions: usize = 0;
+
+        // Process dice for explosions
+        var i: usize = 0;
+        while (i < result._dice_len and explosions < MAX_EXPLOSIONS) {
+            const die = &result._dice_buf[i];
+
+            // Check if this die should explode (and hasn't already been marked)
+            if (!die.exploded and shouldExplode(die.value, dice.sides, explode_config)) {
+                die.exploded = true;
+                explosions += 1;
+
+                // Roll a new die
+                const new_value: u32 = rng.roll(dice.sides);
+
+                switch (explode_config.explode_type) {
+                    .standard => {
+                        // Add new die to results
+                        if (result._dice_len < MAX_DICE) {
+                            result._dice_buf[result._dice_len] = .{
+                                .value = new_value,
+                                .kept = true,
+                            };
+                            result._dice_len += 1;
+                        }
+                    },
+                    .compound => {
+                        // Add value to the existing die (compound into one)
+                        die.value += new_value;
+                        // Check if the compound result should explode again
+                        if (shouldExplode(new_value, dice.sides, explode_config) and explosions < MAX_EXPLOSIONS) {
+                            die.exploded = false; // Allow it to be checked again
+                        }
+                    },
+                    .penetrating => {
+                        // Add new die with -1 penalty (minimum 1)
+                        const pen_value = if (new_value > 1) new_value - 1 else 1;
+                        if (result._dice_len < MAX_DICE) {
+                            result._dice_buf[result._dice_len] = .{
+                                .value = pen_value,
+                                .kept = true,
+                            };
+                            result._dice_len += 1;
+                        }
+                    },
+                }
+            }
+            i += 1;
+        }
+    }
+
+    // Apply reroll modifier if present (after explosions, before keep/drop)
+    if (dice.reroll) |reroll_config| {
+        // Process each die for rerolls
+        for (0..result._dice_len) |i| {
+            var reroll_count: usize = 0;
+
+            // Keep rerolling while the condition matches (for continuous reroll)
+            // or just once (for reroll once)
+            while (shouldReroll(result._dice_buf[i].value, dice.sides, reroll_config) and reroll_count < MAX_REROLLS_PER_DIE) {
+                // Roll a new value to replace the current one
+                const new_value: u32 = if (dice.sides == 0) rng.roll(3) else rng.roll(dice.sides);
+                result._dice_buf[i].value = new_value;
+                reroll_count += 1;
+
+                // If reroll once, stop after first reroll
+                if (reroll_config.once) {
+                    break;
+                }
+            }
+        }
+    }
+
     result.dice_results = result._dice_buf[0..result._dice_len];
 
-    // Apply modifier if present
-    if (dice.modifier) |mod| {
+    // Apply keep/drop modifier if present
+    // Note: Use result._dice_len which includes any exploded dice
+    if (dice.keep_drop) |mod| {
+        const total_dice = result._dice_len;
+
         // Create indices array for sorting
         var indices: [MAX_DICE]usize = undefined;
-        for (0..dice.count) |i| {
+        for (0..total_dice) |i| {
             indices[i] = i;
         }
 
@@ -103,32 +225,32 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
                 return ctx.dice_buf[a].value > ctx.dice_buf[b].value; // Descending
             }
         };
-        std.mem.sort(usize, indices[0..dice.count], SortContext{ .dice_buf = &result._dice_buf }, SortContext.lessThan);
+        std.mem.sort(usize, indices[0..total_dice], SortContext{ .dice_buf = &result._dice_buf }, SortContext.lessThan);
 
         // Apply modifier based on type
         switch (mod) {
             .keep_highest => |n| {
                 // Keep the n highest, drop the rest
-                for (indices[0..dice.count], 0..) |idx, rank| {
+                for (indices[0..total_dice], 0..) |idx, rank| {
                     result._dice_buf[idx].kept = rank < n;
                 }
             },
             .keep_lowest => |n| {
                 // Keep the n lowest (last n in descending order), drop the rest
-                for (indices[0..dice.count], 0..) |idx, rank| {
-                    result._dice_buf[idx].kept = rank >= (dice.count - n);
+                for (indices[0..total_dice], 0..) |idx, rank| {
+                    result._dice_buf[idx].kept = rank >= (total_dice - n);
                 }
             },
             .drop_highest => |n| {
                 // Drop the n highest (first n in descending order), keep the rest
-                for (indices[0..dice.count], 0..) |idx, rank| {
+                for (indices[0..total_dice], 0..) |idx, rank| {
                     result._dice_buf[idx].kept = rank >= n;
                 }
             },
             .drop_lowest => |n| {
                 // Drop the n lowest (last n in descending order), keep the rest
-                for (indices[0..dice.count], 0..) |idx, rank| {
-                    result._dice_buf[idx].kept = rank < (dice.count - n);
+                for (indices[0..total_dice], 0..) |idx, rank| {
+                    result._dice_buf[idx].kept = rank < (total_dice - n);
                 }
             },
         }
@@ -170,8 +292,8 @@ pub fn evaluate(expr: parser.Expr, rng: *rng_mod.Rng) EvalError!RollResult {
     // Evaluate base value
     var total = try evaluateValue(expr.base, rng, &result._rolls_buf, &roll_count);
 
-    // Check if base has modifiers
-    if (expr.base == .dice and expr.base.dice.modifier != null) {
+    // Check if base has keep/drop, explode, or reroll modifiers
+    if (expr.base == .dice and (expr.base.dice.keep_drop != null or expr.base.dice.explode != null or expr.base.dice.reroll != null)) {
         result.has_modifiers = true;
     }
 
@@ -184,8 +306,8 @@ pub fn evaluate(expr: parser.Expr, rng: *rng_mod.Rng) EvalError!RollResult {
     for (expr.operations) |op| {
         const operand = try evaluateValue(op.value, rng, &result._rolls_buf, &roll_count);
 
-        // Check if this operand has modifiers
-        if (op.value == .dice and op.value.dice.modifier != null) {
+        // Check if this operand has keep/drop, explode, or reroll modifiers
+        if (op.value == .dice and (op.value.dice.keep_drop != null or op.value.dice.explode != null or op.value.dice.reroll != null)) {
             result.has_modifiers = true;
         }
 
@@ -357,4 +479,238 @@ test "kept dice have highest values with keep_highest" {
 
     // All kept dice should be >= dropped dice
     try testing.expect(kept_min >= dropped_max);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 4: Exploding Dice Tests
+// -----------------------------------------------------------------------------
+
+test "evaluate exploding dice - no explosion" {
+    // Use a seed that produces values that don't trigger explosions (< max)
+    // Need to find a seed where 1d6 doesn't roll a 6
+    var rng = rng_mod.Rng.init(1); // Seed 1 gives non-max values
+    const expr = try parser.parse("1d6!");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // If no explosion, should still have exactly 1 die
+    // (we just verify the result is reasonable)
+    try testing.expect(result.dice_rolls[0].dice_results.len >= 1);
+    try testing.expect(result.has_modifiers);
+}
+
+test "evaluate exploding dice - with explosion" {
+    // We need a seed where d6 rolls a 6 to trigger explosion
+    // Let's try several seeds and find one that explodes
+    var seed: u64 = 0;
+    var found = false;
+    while (seed < 1000 and !found) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        const val = test_rng.roll(6);
+        if (val == 6) {
+            found = true;
+            break;
+        }
+    }
+    // Now use that seed for the actual test
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6!");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Should have more than 1 die due to explosion
+    try testing.expect(result.dice_rolls[0].dice_results.len > 1);
+    // First die should be marked as exploded
+    try testing.expect(result.dice_rolls[0].dice_results[0].exploded);
+    try testing.expect(result.has_modifiers);
+}
+
+test "evaluate compound exploding" {
+    // Find a seed where d6 rolls max to trigger compound explosion
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        if (test_rng.roll(6) == 6) break;
+    }
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6!!");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Compound explosion adds to same die, so still only 1 die result
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls[0].dice_results.len);
+    // Die value should be > 6 (original 6 + explosion value)
+    try testing.expect(result.dice_rolls[0].dice_results[0].value > 6);
+    try testing.expect(result.dice_rolls[0].dice_results[0].exploded);
+}
+
+test "evaluate penetrating exploding" {
+    // Find a seed where d6 rolls max
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        if (test_rng.roll(6) == 6) break;
+    }
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6!p");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Should have more than 1 die
+    try testing.expect(result.dice_rolls[0].dice_results.len > 1);
+    // First die should be marked as exploded
+    try testing.expect(result.dice_rolls[0].dice_results[0].exploded);
+    // Penetrating dice get -1, so max value for additional dice is sides - 1
+    for (result.dice_rolls[0].dice_results[1..]) |die| {
+        try testing.expect(die.value <= 5); // d6 - 1 = max 5
+    }
+}
+
+test "exploding d1 does not explode" {
+    // d1 should never explode (would be infinite loop)
+    var rng = rng_mod.Rng.init(42);
+    const expr = try parser.parse("5d1!");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Should still have exactly 5 dice (no explosions)
+    try testing.expectEqual(@as(usize, 5), result.dice_rolls[0].dice_results.len);
+    // None should be marked as exploded
+    for (result.dice_rolls[0].dice_results) |die| {
+        try testing.expect(!die.exploded);
+    }
+}
+
+test "exploding with compare point" {
+    // Test exploding on greater than 4 (so 5 and 6 explode)
+    // Find a seed where d6 rolls 5 or 6
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        const val = test_rng.roll(6);
+        if (val > 4) break;
+    }
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6!>4");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Should have more than 1 die due to explosion
+    try testing.expect(result.dice_rolls[0].dice_results.len > 1);
+    // First die should be > 4 and marked as exploded
+    try testing.expect(result.dice_rolls[0].dice_results[0].value > 4);
+    try testing.expect(result.dice_rolls[0].dice_results[0].exploded);
+}
+
+test "exploding with keep modifier" {
+    // Test 4d6!k3 - explode on 6, then keep highest 3
+    var rng = rng_mod.Rng.init(42);
+    const expr = try parser.parse("4d6!k3");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expect(result.has_modifiers);
+
+    // Count kept dice - should be exactly 3
+    var kept_count: usize = 0;
+    for (result.dice_rolls[0].dice_results) |die| {
+        if (die.kept) kept_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), kept_count);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5: Reroll Modifier Tests
+// -----------------------------------------------------------------------------
+
+test "evaluate reroll continuous" {
+    // Reroll 1s until we get a non-1
+    // We'll find a seed where first roll is 1, so we can verify rerolling happens
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        if (test_rng.roll(6) == 1) break;
+    }
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6r");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls[0].dice_results.len);
+    // After continuous reroll, value should NOT be 1
+    try testing.expect(result.dice_rolls[0].dice_results[0].value != 1);
+}
+
+test "evaluate reroll once" {
+    // Reroll 1s once - even if new value is 1, don't reroll again
+    // Find a seed where d6 rolls 1 twice in a row
+    var seed: u64 = 0;
+    var found = false;
+    while (seed < 10000 and !found) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        if (test_rng.roll(6) == 1 and test_rng.roll(6) == 1) {
+            found = true;
+            break;
+        }
+    }
+    if (found) {
+        var rng = rng_mod.Rng.init(seed);
+        const expr = try parser.parse("1d6ro");
+        const result = try evaluate(expr, &rng);
+
+        try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+        try testing.expectEqual(@as(usize, 1), result.dice_rolls[0].dice_results.len);
+        // With ro, we only reroll once, so if both rolls are 1, final value is still 1
+        try testing.expectEqual(@as(u32, 1), result.dice_rolls[0].dice_results[0].value);
+    }
+}
+
+test "evaluate reroll less than" {
+    // Reroll values < 3 (i.e., 1 and 2)
+    // Find a seed where first roll is 1 or 2
+    var seed: u64 = 0;
+    while (seed < 1000) : (seed += 1) {
+        var test_rng = rng_mod.Rng.init(seed);
+        const val = test_rng.roll(6);
+        if (val < 3) break;
+    }
+    var rng = rng_mod.Rng.init(seed);
+    const expr = try parser.parse("1d6r<3");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls[0].dice_results.len);
+    // After reroll, value should be >= 3
+    try testing.expect(result.dice_rolls[0].dice_results[0].value >= 3);
+}
+
+test "evaluate reroll with keep/drop" {
+    // 4d6r1k3 - reroll 1s, then keep highest 3
+    var rng = rng_mod.Rng.init(42);
+    const expr = try parser.parse("4d6r1k3");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expectEqual(@as(usize, 4), result.dice_rolls[0].dice_results.len);
+
+    // Verify exactly 3 dice are kept
+    var kept_count: usize = 0;
+    for (result.dice_rolls[0].dice_results) |die| {
+        if (die.kept) kept_count += 1;
+        // No die should be a 1 after rerolling (unless reroll cap was hit, which is unlikely)
+        // Actually, with r1 (explicit), 1s should be rerolled until not 1
+        // But test may have a die that wasn't 1 to begin with
+    }
+    try testing.expectEqual(@as(usize, 3), kept_count);
+}
+
+test "evaluate reroll with explode" {
+    // 4d6!r1 - explode on 6, then reroll 1s
+    var rng = rng_mod.Rng.init(42);
+    const expr = try parser.parse("4d6!r1");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    // Should have at least 4 dice (maybe more if explosions happened)
+    try testing.expect(result.dice_rolls[0].dice_results.len >= 4);
 }

@@ -60,19 +60,59 @@ pub const Expr = struct {
 // Phase 3: Modifiers
 // =============================================================================
 
-/// Dice modifiers for keep/drop operations
-pub const Modifier = union(enum) {
+/// Keep/drop modifiers for dice
+pub const KeepDrop = union(enum) {
     keep_highest: u32, // k, kh - keep highest N dice
     keep_lowest: u32, // kl - keep lowest N dice
     drop_highest: u32, // dh - drop highest N dice
     drop_lowest: u32, // d, dl - drop lowest N dice
 };
 
+// =============================================================================
+// Phase 4: Exploding Dice
+// =============================================================================
+
+/// Comparison operators for explode/reroll thresholds
+pub const CompareOp = enum {
+    eq, // =
+    gt, // >
+    lt, // <
+    gte, // >=
+    lte, // <=
+};
+
+/// A comparison point (operator + value)
+pub const ComparePoint = struct {
+    op: CompareOp,
+    value: u32,
+};
+
+/// Type of explosion behavior
+pub const ExplodeType = enum {
+    standard, // ! - add new dice
+    compound, // !! - add to same die
+    penetrating, // !p - new die with -1 penalty
+};
+
+/// Configuration for exploding dice
+pub const ExplodeConfig = struct {
+    explode_type: ExplodeType = .standard,
+    compare: ?ComparePoint = null, // null = explode on max
+};
+
+/// Configuration for reroll modifiers
+pub const RerollConfig = struct {
+    once: bool = false, // true for 'ro', false for 'r'
+    compare: ?ComparePoint = null, // null = reroll 1s
+};
+
 /// A single dice roll specification (e.g., 2d6, 4d6kh3)
 pub const DiceRoll = struct {
     count: u32, // Number of dice to roll
     sides: u32, // Number of sides (0 reserved for Fudge dice, 100 for d%)
-    modifier: ?Modifier = null, // Optional keep/drop modifier
+    explode: ?ExplodeConfig = null, // Optional explode modifier (!, !!, !p)
+    reroll: ?RerollConfig = null, // Optional reroll modifier (r, ro)
+    keep_drop: ?KeepDrop = null, // Optional keep/drop modifier
 };
 
 // =============================================================================
@@ -252,11 +292,105 @@ const Parser = struct {
         return .{ .number = num };
     }
 
+    /// Parse a comparison point (=N, >N, <N, >=N, <=N)
+    /// Returns null if no comparison point found
+    fn parseComparePoint(self: *Parser) ParseError!?ComparePoint {
+        const c = self.peek() orelse return null;
+
+        var op: CompareOp = undefined;
+
+        if (c == '=') {
+            _ = self.advance();
+            op = .eq;
+        } else if (c == '>') {
+            _ = self.advance();
+            if (self.matchChar('=')) {
+                op = .gte;
+            } else {
+                op = .gt;
+            }
+        } else if (c == '<') {
+            _ = self.advance();
+            if (self.matchChar('=')) {
+                op = .lte;
+            } else {
+                op = .lt;
+            }
+        } else {
+            return null;
+        }
+
+        // Parse the value
+        const value = self.parseUnsigned() catch |err| switch (err) {
+            error.UnexpectedCharacter => return error.InvalidModifier,
+            else => return err,
+        };
+
+        return .{ .op = op, .value = value };
+    }
+
+    /// Parse an explode modifier (!, !!, !p) with optional compare point
+    /// Returns null if no explode modifier found
+    fn parseExplode(self: *Parser) ParseError!?ExplodeConfig {
+        // Check for '!'
+        if (!self.matchChar('!')) {
+            return null;
+        }
+
+        var config = ExplodeConfig{};
+
+        // Check for compound (!!) or penetrating (!p)
+        if (self.matchChar('!')) {
+            config.explode_type = .compound;
+        } else if (self.matchChar('p')) {
+            config.explode_type = .penetrating;
+        }
+
+        // Parse optional compare point
+        config.compare = try self.parseComparePoint();
+
+        return config;
+    }
+
+    /// Parse a reroll modifier (r, ro) with optional compare point
+    /// Returns null if no reroll modifier found
+    fn parseReroll(self: *Parser) ParseError!?RerollConfig {
+        // Check for 'r' or 'R'
+        if (!self.matchChar('r')) {
+            return null;
+        }
+
+        var config = RerollConfig{};
+
+        // Check for 'o' (reroll once)
+        if (self.matchChar('o')) {
+            config.once = true;
+        }
+
+        // Parse optional compare point
+        if (try self.parseComparePoint()) |cmp| {
+            config.compare = cmp;
+        } else {
+            // Check if there's a bare number (e.g., r1 means reroll on 1)
+            const c = self.peek();
+            if (c != null and std.ascii.isDigit(c.?)) {
+                const value = self.parseUnsigned() catch |err| switch (err) {
+                    error.UnexpectedCharacter => return error.InvalidModifier,
+                    else => return err,
+                };
+                config.compare = .{ .op = .eq, .value = value };
+            }
+            // If no compare point and no bare number, config.compare stays null (default: reroll 1s)
+        }
+
+        return config;
+    }
+
     /// Parse a keep/drop modifier (k, kh, kl, d, dh, dl)
     /// Returns null if no modifier found at current position
     /// The tricky part: 'd' after sides could be drop modifier OR start of new expression
     /// We resolve this by: if 'd' is followed by a digit, it's drop modifier
-    fn parseModifier(self: *Parser, dice_count: u32) ParseError!?Modifier {
+    fn parseModifier(self: *Parser, dice_count: u32) ParseError!?KeepDrop {
         const c = self.peek() orelse return null;
 
         // Check for 'k' (keep) modifiers
@@ -374,13 +508,21 @@ const Parser = struct {
         // Parse sides
         const sides = try self.parseSides();
 
-        // Parse optional modifier (Phase 3)
-        const modifier = try self.parseModifier(count);
+        // Parse optional explode modifier (!, !!, !p) - must come before reroll
+        const explode = try self.parseExplode();
+
+        // Parse optional reroll modifier (r, ro) - must come after explode, before keep/drop
+        const reroll = try self.parseReroll();
+
+        // Parse optional keep/drop modifier
+        const keep_drop = try self.parseModifier(count);
 
         return .{
             .count = count,
             .sides = sides,
-            .modifier = modifier,
+            .explode = explode,
+            .reroll = reroll,
+            .keep_drop = keep_drop,
         };
     }
 
@@ -457,23 +599,58 @@ fn expectDice(value: ExprValue, expected_count: u32, expected_sides: u32) !void 
     try testing.expectEqual(expected_sides, value.dice.sides);
 }
 
-fn expectDiceWithModifier(value: ExprValue, expected_count: u32, expected_sides: u32, expected_modifier: ?Modifier) !void {
+fn expectDiceWithModifier(value: ExprValue, expected_count: u32, expected_sides: u32, expected_keep_drop: ?KeepDrop) !void {
     try testing.expect(value == .dice);
     try testing.expectEqual(expected_count, value.dice.count);
     try testing.expectEqual(expected_sides, value.dice.sides);
-    if (expected_modifier) |exp_mod| {
-        const actual_mod = value.dice.modifier orelse {
+    if (expected_keep_drop) |exp_kd| {
+        const actual_kd = value.dice.keep_drop orelse {
             return error.TestExpectedEqual;
         };
-        try testing.expectEqual(exp_mod, actual_mod);
+        try testing.expectEqual(exp_kd, actual_kd);
     } else {
-        try testing.expect(value.dice.modifier == null);
+        try testing.expect(value.dice.keep_drop == null);
     }
 }
 
 fn expectNumber(value: ExprValue, expected: i32) !void {
     try testing.expect(value == .number);
     try testing.expectEqual(expected, value.number);
+}
+
+fn expectDiceWithExplode(value: ExprValue, expected_count: u32, expected_sides: u32, expected_explode: ?ExplodeConfig, expected_keep_drop: ?KeepDrop) !void {
+    try testing.expect(value == .dice);
+    try testing.expectEqual(expected_count, value.dice.count);
+    try testing.expectEqual(expected_sides, value.dice.sides);
+
+    // Check explode config
+    if (expected_explode) |exp_ex| {
+        const actual_ex = value.dice.explode orelse {
+            return error.TestExpectedEqual;
+        };
+        try testing.expectEqual(exp_ex.explode_type, actual_ex.explode_type);
+        if (exp_ex.compare) |exp_cmp| {
+            const actual_cmp = actual_ex.compare orelse {
+                return error.TestExpectedEqual;
+            };
+            try testing.expectEqual(exp_cmp.op, actual_cmp.op);
+            try testing.expectEqual(exp_cmp.value, actual_cmp.value);
+        } else {
+            try testing.expect(actual_ex.compare == null);
+        }
+    } else {
+        try testing.expect(value.dice.explode == null);
+    }
+
+    // Check keep/drop
+    if (expected_keep_drop) |exp_kd| {
+        const actual_kd = value.dice.keep_drop orelse {
+            return error.TestExpectedEqual;
+        };
+        try testing.expectEqual(exp_kd, actual_kd);
+    } else {
+        try testing.expect(value.dice.keep_drop == null);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -975,4 +1152,185 @@ test "parse basic dice has no modifier '2d6'" {
 test "parse d20 has no modifier" {
     const result = try parse("d20");
     try expectDiceWithModifier(result.base, 1, 20, null);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 4: Exploding Dice Tests
+// -----------------------------------------------------------------------------
+
+test "parse exploding '1d6!'" {
+    const result = try parse("1d6!");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = null }, null);
+}
+
+test "parse exploding with threshold '1d6!>4'" {
+    const result = try parse("1d6!>4");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = .{ .op = .gt, .value = 4 } }, null);
+}
+
+test "parse compound exploding '1d6!!'" {
+    const result = try parse("1d6!!");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .compound, .compare = null }, null);
+}
+
+test "parse penetrating '1d6!p'" {
+    const result = try parse("1d6!p");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .penetrating, .compare = null }, null);
+}
+
+test "parse exploding with keep '4d6!k3'" {
+    const result = try parse("4d6!k3");
+    try expectDiceWithExplode(result.base, 4, 6, .{ .explode_type = .standard, .compare = null }, .{ .keep_highest = 3 });
+}
+
+test "parse exploding less than '1d6!<3'" {
+    const result = try parse("1d6!<3");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = .{ .op = .lt, .value = 3 } }, null);
+}
+
+test "parse exploding equals '1d6!=5'" {
+    const result = try parse("1d6!=5");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = .{ .op = .eq, .value = 5 } }, null);
+}
+
+test "parse exploding gte '1d6!>=5'" {
+    const result = try parse("1d6!>=5");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = .{ .op = .gte, .value = 5 } }, null);
+}
+
+test "parse exploding lte '1d6!<=2'" {
+    const result = try parse("1d6!<=2");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .standard, .compare = .{ .op = .lte, .value = 2 } }, null);
+}
+
+test "parse compound exploding with threshold '2d10!!>8'" {
+    const result = try parse("2d10!!>8");
+    try expectDiceWithExplode(result.base, 2, 10, .{ .explode_type = .compound, .compare = .{ .op = .gt, .value = 8 } }, null);
+}
+
+test "parse penetrating with threshold '1d6!p>=5'" {
+    const result = try parse("1d6!p>=5");
+    try expectDiceWithExplode(result.base, 1, 6, .{ .explode_type = .penetrating, .compare = .{ .op = .gte, .value = 5 } }, null);
+}
+
+test "parse exploding in expression '2d6!+5'" {
+    const result = try parse("2d6!+5");
+    try expectDiceWithExplode(result.base, 2, 6, .{ .explode_type = .standard, .compare = null }, null);
+    try testing.expectEqual(@as(usize, 1), result.operations.len);
+    try testing.expectEqual(Op.add, result.operations[0].op);
+    try expectNumber(result.operations[0].value, 5);
+}
+
+test "parse basic dice has no explode '2d6'" {
+    const result = try parse("2d6");
+    try testing.expect(result.base.dice.explode == null);
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5: Reroll Modifier Tests
+// -----------------------------------------------------------------------------
+
+fn expectDiceWithReroll(value: ExprValue, expected_count: u32, expected_sides: u32, expected_reroll: ?RerollConfig, expected_keep_drop: ?KeepDrop) !void {
+    try testing.expect(value == .dice);
+    try testing.expectEqual(expected_count, value.dice.count);
+    try testing.expectEqual(expected_sides, value.dice.sides);
+
+    // Check reroll config
+    if (expected_reroll) |exp_rr| {
+        const actual_rr = value.dice.reroll orelse {
+            return error.TestExpectedEqual;
+        };
+        try testing.expectEqual(exp_rr.once, actual_rr.once);
+        if (exp_rr.compare) |exp_cmp| {
+            const actual_cmp = actual_rr.compare orelse {
+                return error.TestExpectedEqual;
+            };
+            try testing.expectEqual(exp_cmp.op, actual_cmp.op);
+            try testing.expectEqual(exp_cmp.value, actual_cmp.value);
+        } else {
+            try testing.expect(actual_rr.compare == null);
+        }
+    } else {
+        try testing.expect(value.dice.reroll == null);
+    }
+
+    // Check keep/drop
+    if (expected_keep_drop) |exp_kd| {
+        const actual_kd = value.dice.keep_drop orelse {
+            return error.TestExpectedEqual;
+        };
+        try testing.expectEqual(exp_kd, actual_kd);
+    } else {
+        try testing.expect(value.dice.keep_drop == null);
+    }
+}
+
+test "parse reroll '2d6r1'" {
+    const result = try parse("2d6r1");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = false, .compare = .{ .op = .eq, .value = 1 } }, null);
+}
+
+test "parse reroll default '2d6r'" {
+    // 'r' without a value defaults to reroll 1s (compare is null)
+    const result = try parse("2d6r");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = false, .compare = null }, null);
+}
+
+test "parse reroll once '2d6ro1'" {
+    const result = try parse("2d6ro1");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = true, .compare = .{ .op = .eq, .value = 1 } }, null);
+}
+
+test "parse reroll once default '2d6ro'" {
+    // 'ro' without a value defaults to reroll 1s once (compare is null)
+    const result = try parse("2d6ro");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = true, .compare = null }, null);
+}
+
+test "parse reroll less than '2d6r<3'" {
+    const result = try parse("2d6r<3");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = false, .compare = .{ .op = .lt, .value = 3 } }, null);
+}
+
+test "parse reroll lte '2d6r<=2'" {
+    const result = try parse("2d6r<=2");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = false, .compare = .{ .op = .lte, .value = 2 } }, null);
+}
+
+test "parse reroll combined '4d6r1k3'" {
+    // reroll 1s, then keep highest 3
+    const result = try parse("4d6r1k3");
+    try expectDiceWithReroll(result.base, 4, 6, .{ .once = false, .compare = .{ .op = .eq, .value = 1 } }, .{ .keep_highest = 3 });
+}
+
+test "parse reroll with explode '4d6!r1'" {
+    // explode on max, then reroll 1s
+    const result = try parse("4d6!r1");
+    try testing.expect(result.base == .dice);
+    try testing.expectEqual(@as(u32, 4), result.base.dice.count);
+    try testing.expectEqual(@as(u32, 6), result.base.dice.sides);
+    // Check explode is present
+    try testing.expect(result.base.dice.explode != null);
+    try testing.expectEqual(ExplodeType.standard, result.base.dice.explode.?.explode_type);
+    try testing.expect(result.base.dice.explode.?.compare == null);
+    // Check reroll is present
+    try testing.expect(result.base.dice.reroll != null);
+    try testing.expect(!result.base.dice.reroll.?.once);
+    try testing.expectEqual(CompareOp.eq, result.base.dice.reroll.?.compare.?.op);
+    try testing.expectEqual(@as(u32, 1), result.base.dice.reroll.?.compare.?.value);
+}
+
+test "parse reroll greater than '2d6r>5'" {
+    const result = try parse("2d6r>5");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = false, .compare = .{ .op = .gt, .value = 5 } }, null);
+}
+
+test "parse reroll once lte '2d6ro<=2'" {
+    const result = try parse("2d6ro<=2");
+    try expectDiceWithReroll(result.base, 2, 6, .{ .once = true, .compare = .{ .op = .lte, .value = 2 } }, null);
+}
+
+test "parse basic dice has no reroll '2d6'" {
+    const result = try parse("2d6");
+    try testing.expect(result.base.dice.reroll == null);
 }
