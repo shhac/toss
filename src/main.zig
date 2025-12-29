@@ -1,8 +1,9 @@
 const std = @import("std");
-const dice = @import("dice.zig");
+const parser = @import("parser.zig");
+const eval = @import("eval.zig");
 const rng_mod = @import("rng.zig");
 
-const version = "0.2.0";
+const version = "0.3.0";
 
 const help_text =
     \\toss - A dice rolling CLI
@@ -10,13 +11,28 @@ const help_text =
     \\Usage: toss [OPTIONS] <DICE>...
     \\
     \\Arguments:
-    \\  <DICE>...           Dice specifications (e.g., 2d6, 1d4)
+    \\  <DICE>...           Dice expressions (e.g., 2d6, 4d6k3, 2d6+5)
     \\
     \\Options:
     \\  -s, --seed <NUM>    Seed for reproducible rolls
     \\      --show-seed     Output the seed used to stderr
     \\  -h, --help          Display this help message
     \\  -V, --version       Show version information
+    \\
+    \\Dice notation:
+    \\  NdS                 Roll N dice with S sides (e.g., 2d6)
+    \\  dS                  Roll 1 die (e.g., d20)
+    \\  d%                  Percentile die (d100)
+    \\  dF                  Fudge die (-1, 0, +1)
+    \\
+    \\Modifiers:
+    \\  k, kh<N>            Keep highest N dice (e.g., 4d6k3)
+    \\  kl<N>               Keep lowest N dice
+    \\  d, dl<N>            Drop lowest N dice (e.g., 4d6d1)
+    \\  dh<N>               Drop highest N dice
+    \\
+    \\Arithmetic:
+    \\  +, -, *, /          Combine dice and numbers (e.g., 2d6+5, 1d20+1d4)
     \\
 ;
 
@@ -97,6 +113,18 @@ fn digitCount(n: u32) usize {
     return count;
 }
 
+/// Calculate digit count for signed integers
+fn signedDigitCount(n: i32) usize {
+    if (n == 0) return 1;
+    var count: usize = 0;
+    var value = if (n < 0) -n else n;
+    while (value > 0) : (value = @divTrunc(value, 10)) {
+        count += 1;
+    }
+    if (n < 0) count += 1; // Account for minus sign
+    return count;
+}
+
 /// Write a right-aligned number with the given width and padding character
 fn writeRightAligned(writer: anytype, value: u32, width: usize, pad_char: u8) !void {
     const value_width = digitCount(value);
@@ -105,6 +133,47 @@ fn writeRightAligned(writer: anytype, value: u32, width: usize, pad_char: u8) !v
         try writer.writeByte(pad_char);
     }
     try writer.print("{d}", .{value});
+}
+
+/// Format an expression for display (reconstructs the original notation)
+fn formatExpr(writer: anytype, expr: parser.Expr) !void {
+    try formatExprValue(writer, expr.base);
+    for (expr.operations) |op| {
+        const op_char: u8 = switch (op.op) {
+            .add => '+',
+            .sub => '-',
+            .mul => '*',
+            .div => '/',
+        };
+        try writer.writeByte(op_char);
+        try formatExprValue(writer, op.value);
+    }
+}
+
+fn formatExprValue(writer: anytype, value: parser.ExprValue) !void {
+    switch (value) {
+        .dice => |dice| {
+            try writer.print("{d}d", .{dice.count});
+            if (dice.sides == 0) {
+                try writer.writeByte('F');
+            } else if (dice.sides == 100) {
+                try writer.print("100", .{});
+            } else {
+                try writer.print("{d}", .{dice.sides});
+            }
+            if (dice.modifier) |mod| {
+                switch (mod) {
+                    .keep_highest => |n| try writer.print("k{d}", .{n}),
+                    .keep_lowest => |n| try writer.print("kl{d}", .{n}),
+                    .drop_highest => |n| try writer.print("dh{d}", .{n}),
+                    .drop_lowest => |n| try writer.print("d{d}", .{n}),
+                }
+            }
+        },
+        .number => |num| {
+            try writer.print("{d}", .{num});
+        },
+    }
 }
 
 fn run() !void {
@@ -179,14 +248,14 @@ fn run() !void {
         try err.interface.flush();
     }
 
-    // First pass: parse all dice specs and find max count/sides values
-    var max_count: u32 = 0;
+    // First pass: parse all expressions and find max values for padding
     var max_sides: u32 = 0;
-    var parsed_specs: std.ArrayList(dice.DiceSpec) = .{};
-    defer parsed_specs.deinit(allocator);
+    var parsed_exprs: std.ArrayList(parser.Expr) = .{};
+    defer parsed_exprs.deinit(allocator);
+    var has_errors = false;
 
     for (config.dice_specs) |spec_str| {
-        const spec = dice.parse(spec_str) catch |parse_err| {
+        const expr = parser.parse(spec_str) catch |parse_err| {
             stderr_tty.setColor(&err.interface, .red) catch {};
             try err.interface.print("Error: ", .{});
             stderr_tty.setColor(&err.interface, .reset) catch {};
@@ -195,56 +264,115 @@ fn run() !void {
                 error.InvalidCount => try err.interface.print("Invalid dice count in '{s}'\n", .{spec_str}),
                 error.InvalidSides => try err.interface.print("Invalid sides in '{s}'\n", .{spec_str}),
                 error.Overflow => try err.interface.print("Number too large in '{s}'\n", .{spec_str}),
+                error.UnexpectedCharacter => try err.interface.print("Unexpected character in '{s}'\n", .{spec_str}),
+                error.UnexpectedEndOfInput => try err.interface.print("Unexpected end of input in '{s}'\n", .{spec_str}),
+                error.TooManyOperations => try err.interface.print("Too many operations in '{s}'\n", .{spec_str}),
+                error.DivisionByZero => try err.interface.print("Division by zero in '{s}'\n", .{spec_str}),
+                error.InvalidModifier => try err.interface.print("Invalid modifier in '{s}'\n", .{spec_str}),
             }
             try err.interface.flush();
-            // Store a sentinel value for invalid specs
-            try parsed_specs.append(allocator, .{ .count = 0, .sides = 0 });
+            has_errors = true;
             continue;
         };
 
-        if (spec.count > max_count) {
-            max_count = spec.count;
+        // Find max sides across all dice in expression (before storing)
+        if (expr.base == .dice) {
+            if (expr.base.dice.sides > max_sides) {
+                max_sides = expr.base.dice.sides;
+            }
         }
-        if (spec.sides > max_sides) {
-            max_sides = spec.sides;
+        for (expr.operations) |op| {
+            if (op.value == .dice) {
+                if (op.value.dice.sides > max_sides) {
+                    max_sides = op.value.dice.sides;
+                }
+            }
         }
-        try parsed_specs.append(allocator, spec);
+
+        try parsed_exprs.append(allocator, expr);
     }
 
-    // Calculate the width needed for the max count and sides values
-    const count_width = digitCount(max_count);
+    // Handle case where all specs failed
+    if (parsed_exprs.items.len == 0) {
+        if (has_errors) {
+            std.process.exit(1);
+        }
+        return; // No dice specs provided
+    }
+
+    // Fix up operation slices after all appends (ArrayList may have reallocated)
+    // The slice inside each Expr points to its internal _operations_buf, but after
+    // copying the struct, we need to re-point to the copied buffer
+    for (parsed_exprs.items) |*stored_expr| {
+        stored_expr.operations = stored_expr._operations_buf[0..stored_expr._operations_len];
+    }
+
+    // Calculate padding width
     const sides_width = digitCount(max_sides);
 
-    // Second pass: output with padding
+    // Second pass: evaluate and output
     var row_index: usize = 0;
-    for (config.dice_specs, 0..) |_, spec_index| {
-        const spec = parsed_specs.items[spec_index];
-
-        // Skip invalid specs (already reported error)
-        if (spec.count == 0 and spec.sides == 0) {
+    for (parsed_exprs.items) |expr| {
+        // Evaluate the expression
+        var result = eval.evaluate(expr, &rng) catch |eval_err| {
+            stderr_tty.setColor(&err.interface, .red) catch {};
+            try err.interface.print("Error: ", .{});
+            stderr_tty.setColor(&err.interface, .reset) catch {};
+            switch (eval_err) {
+                error.DivisionByZero => try err.interface.print("Division by zero\n", .{}),
+                error.Overflow => try err.interface.print("Arithmetic overflow\n", .{}),
+                error.TooManyDice => try err.interface.print("Too many dice to roll\n", .{}),
+            }
+            try err.interface.flush();
             continue;
+        };
+
+        // Fix up slices to point to copied buffers (needed because slices contain pointers
+        // that become invalid after struct copy)
+        result.dice_rolls = result._rolls_buf[0..result._rolls_len];
+        for (result._rolls_buf[0..result._rolls_len]) |*roll| {
+            roll.dice_results = roll._dice_buf[0..roll._dice_len];
         }
 
         // Get color group for this row (cycles every 3 rows)
         const group = color_groups[row_index % color_groups.len];
 
-        // Print the dice spec label with padding (dim color)
-        // Format: [<padded_count>d<padded_sides>]
+        // Print the expression label (dim color)
         stdout_tty.setColor(&out.interface, group.label) catch {};
         try out.interface.print("[", .{});
-        try writeRightAligned(&out.interface, spec.count, count_width, '_');
-        try out.interface.print("d", .{});
-        try writeRightAligned(&out.interface, spec.sides, sides_width, '_');
+        try formatExpr(&out.interface, expr);
         try out.interface.print("]", .{});
         stdout_tty.setColor(&out.interface, .reset) catch {};
 
-        // Roll and print each die (alternating colors within group) with padding
-        for (0..spec.count) |die_index| {
-            const result = rng.roll(spec.sides);
-            const result_color = group.results[die_index % group.results.len];
-            stdout_tty.setColor(&out.interface, result_color) catch {};
-            try out.interface.print(" ", .{});
-            try writeRightAligned(&out.interface, result, sides_width, ' ');
+        // Print dice results
+        var die_index: usize = 0;
+        for (result.dice_rolls) |dice_result| {
+            for (dice_result.dice_results) |die| {
+                try out.interface.print(" ", .{});
+
+                if (die.kept) {
+                    // Normal die result with color
+                    const result_color = group.results[die_index % group.results.len];
+                    stdout_tty.setColor(&out.interface, result_color) catch {};
+                    try writeRightAligned(&out.interface, die.value, sides_width, ' ');
+                } else {
+                    // Dropped die - dim with strikethrough styling (~value~)
+                    stdout_tty.setColor(&out.interface, .dim) catch {};
+                    try out.interface.print("~", .{});
+                    try out.interface.print("{d}", .{die.value});
+                    try out.interface.print("~", .{});
+                }
+
+                die_index += 1;
+            }
+        }
+
+        // Print total if expression has modifiers or arithmetic
+        if (result.has_modifiers) {
+            stdout_tty.setColor(&out.interface, .reset) catch {};
+            try out.interface.print(" = ", .{});
+            stdout_tty.setColor(&out.interface, .bold) catch {};
+            try out.interface.print("{d}", .{result.total});
         }
 
         stdout_tty.setColor(&out.interface, .reset) catch {};
@@ -256,11 +384,11 @@ fn run() !void {
 }
 
 pub fn main() void {
-    run() catch |err| {
+    run() catch |run_error| {
         const stderr = std.fs.File.stderr();
         var buf: [256]u8 = undefined;
         var w = stderr.writer(&buf);
-        w.interface.print("Error: {s}\n", .{@errorName(err)}) catch {};
+        w.interface.print("Error: {s}\n", .{@errorName(run_error)}) catch {};
         w.interface.flush() catch {};
         std.process.exit(1);
     };
