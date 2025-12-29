@@ -74,16 +74,16 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseErr
 // Color groups for die roll output (cycles every 3 rows)
 const ColorGroup = struct {
     label: std.io.tty.Color, // Dimmer color for the [XdY] label
-    results: [2]std.io.tty.Color, // Two colors that alternate for die results
+    results: [3]std.io.tty.Color, // Three colors that alternate for die results
 };
 
 const color_groups = [_]ColorGroup{
-    // Group 0: Red/Magenta
-    .{ .label = .dim, .results = .{ .red, .magenta } },
-    // Group 1: Green/Cyan
-    .{ .label = .dim, .results = .{ .green, .cyan } },
-    // Group 2: Blue/Yellow
-    .{ .label = .dim, .results = .{ .blue, .yellow } },
+    // Group 0: Red family
+    .{ .label = .dim, .results = .{ .red, .magenta, .bright_red } },
+    // Group 1: Green family (yellow for contrast instead of cyan)
+    .{ .label = .dim, .results = .{ .green, .yellow, .bright_green } },
+    // Group 2: Blue family
+    .{ .label = .dim, .results = .{ .blue, .cyan, .bright_blue } },
 };
 
 fn run() !void {
