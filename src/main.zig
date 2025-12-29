@@ -3,7 +3,7 @@ const parser = @import("parser.zig");
 const eval = @import("eval.zig");
 const rng_mod = @import("rng.zig");
 
-const version = "0.4.0";
+const version = "0.5.0";
 
 const help_text =
     \\toss - A dice rolling CLI
