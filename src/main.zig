@@ -71,6 +71,21 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseErr
     return config;
 }
 
+// Color groups for die roll output (cycles every 3 rows)
+const ColorGroup = struct {
+    label: std.io.tty.Color, // Dimmer color for the [XdY] label
+    results: [2]std.io.tty.Color, // Two colors that alternate for die results
+};
+
+const color_groups = [_]ColorGroup{
+    // Group 0: Red/Magenta
+    .{ .label = .dim, .results = .{ .red, .magenta } },
+    // Group 1: Green/Cyan
+    .{ .label = .dim, .results = .{ .green, .cyan } },
+    // Group 2: Blue/Yellow
+    .{ .label = .dim, .results = .{ .blue, .yellow } },
+};
+
 fn run() !void {
     // Set up allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -92,8 +107,9 @@ fn run() !void {
     var err_buf: [256]u8 = undefined;
     var err = stderr.writer(&err_buf);
 
-    // Detect TTY for colored output
-    const tty_config = std.io.tty.Config.detect(stderr);
+    // Detect TTY for colored output (stdout for results, stderr for errors/seed)
+    const stdout_tty = std.io.tty.Config.detect(stdout);
+    const stderr_tty = std.io.tty.Config.detect(stderr);
 
     // Parse arguments
     const config = parseArgs(allocator, args) catch |parse_err| {
@@ -134,21 +150,21 @@ fn run() !void {
     // Initialize RNG
     var rng = rng_mod.Rng.init(config.seed);
 
-    // Show seed if requested
+    // Show seed if requested (all dim)
     if (config.show_seed) {
-        tty_config.setColor(&err.interface, .dim) catch {};
-        try err.interface.print("[seed] ", .{});
-        tty_config.setColor(&err.interface, .reset) catch {};
-        try err.interface.print("{d}\n", .{rng.seed});
+        stderr_tty.setColor(&err.interface, .dim) catch {};
+        try err.interface.print("[seed] {d}\n", .{rng.seed});
+        stderr_tty.setColor(&err.interface, .reset) catch {};
         try err.interface.flush();
     }
 
     // Process each dice spec
+    var row_index: usize = 0;
     for (config.dice_specs) |spec_str| {
         const spec = dice.parse(spec_str) catch |parse_err| {
-            tty_config.setColor(&err.interface, .red) catch {};
+            stderr_tty.setColor(&err.interface, .red) catch {};
             try err.interface.print("Error: ", .{});
-            tty_config.setColor(&err.interface, .reset) catch {};
+            stderr_tty.setColor(&err.interface, .reset) catch {};
             switch (parse_err) {
                 error.InvalidFormat => try err.interface.print("Invalid dice format '{s}' (expected NdN, e.g., 2d6)\n", .{spec_str}),
                 error.InvalidCount => try err.interface.print("Invalid dice count in '{s}'\n", .{spec_str}),
@@ -159,16 +175,25 @@ fn run() !void {
             continue;
         };
 
-        // Print the dice spec label
-        try out.interface.print("[{s}]", .{spec_str});
+        // Get color group for this row (cycles every 3 rows)
+        const group = color_groups[row_index % color_groups.len];
 
-        // Roll and print each die
-        for (0..spec.count) |_| {
+        // Print the dice spec label (dim color)
+        stdout_tty.setColor(&out.interface, group.label) catch {};
+        try out.interface.print("[{s}]", .{spec_str});
+        stdout_tty.setColor(&out.interface, .reset) catch {};
+
+        // Roll and print each die (alternating colors within group)
+        for (0..spec.count) |die_index| {
             const result = rng.roll(spec.sides);
+            const result_color = group.results[die_index % group.results.len];
+            stdout_tty.setColor(&out.interface, result_color) catch {};
             try out.interface.print(" {d}", .{result});
         }
 
+        stdout_tty.setColor(&out.interface, .reset) catch {};
         try out.interface.print("\n", .{});
+        row_index += 1;
     }
 
     try out.interface.flush();
