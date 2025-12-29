@@ -2,6 +2,8 @@ const std = @import("std");
 const dice = @import("dice.zig");
 const rng_mod = @import("rng.zig");
 
+const version = "0.1.0";
+
 const help_text =
     \\toss - A dice rolling CLI
     \\
@@ -14,6 +16,7 @@ const help_text =
     \\  -s, --seed <NUM>    Seed for reproducible rolls
     \\      --show-seed     Output the seed used to stderr
     \\  -h, --help          Display this help message
+    \\  -V, --version       Show version information
     \\
 ;
 
@@ -21,6 +24,7 @@ const Config = struct {
     seed: ?u64 = null,
     show_seed: bool = false,
     help: bool = false,
+    version: bool = false,
     dice_specs: []const []const u8 = &.{},
 };
 
@@ -41,6 +45,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseErr
 
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             config.help = true;
+            return config;
+        } else if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-V")) {
+            config.version = true;
             return config;
         } else if (std.mem.eql(u8, arg, "--show-seed")) {
             config.show_seed = true;
@@ -113,6 +120,13 @@ fn run() !void {
     // Handle --help
     if (config.help) {
         try out.interface.print("{s}", .{help_text});
+        try out.interface.flush();
+        return;
+    }
+
+    // Handle --version
+    if (config.version) {
+        try out.interface.print("toss {s}\n", .{version});
         try out.interface.flush();
         return;
     }
