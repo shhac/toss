@@ -2,7 +2,7 @@ const std = @import("std");
 const dice = @import("dice.zig");
 const rng_mod = @import("rng.zig");
 
-const version = "0.1.0";
+const version = "0.2.0";
 
 const help_text =
     \\toss - A dice rolling CLI
