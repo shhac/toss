@@ -1,6 +1,6 @@
 # toss
 
-A fast, tiny dice rolling CLI written in Zig.
+A fast dice rolling CLI written in Zig.
 
 ## Installation
 
@@ -45,7 +45,7 @@ toss --help
 ## Features
 
 - **Fast**: Single binary, no runtime dependencies
-- **Tiny**: 28-76KB release binary (platform dependent)
+- **Small**: 28-76KB release binary (smallest on Linux)
 - **Reproducible**: Optional `--seed` for deterministic rolls
 - **Scriptable**: Results to stdout, diagnostics to stderr
 - **Colored output**: Row colors cycle through color groups (respects `NO_COLOR`)
