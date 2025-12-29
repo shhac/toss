@@ -16,6 +16,8 @@ const help_text =
     \\Options:
     \\  -s, --seed <NUM>    Seed for reproducible rolls
     \\      --show-seed     Output the seed used to stderr
+    \\      --no-labels     Omit the [expr] label prefix
+    \\      --result-only   Only show the final total (no individual dice)
     \\  -h, --help          Display this help message
     \\  -V, --version       Show version information
     \\
@@ -39,6 +41,8 @@ const help_text =
 const Config = struct {
     seed: ?u64 = null,
     show_seed: bool = false,
+    no_labels: bool = false,
+    result_only: bool = false,
     help: bool = false,
     version: bool = false,
     dice_specs: []const []const u8 = &.{},
@@ -67,6 +71,10 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ArgParseErr
             return config;
         } else if (std.mem.eql(u8, arg, "--show-seed")) {
             config.show_seed = true;
+        } else if (std.mem.eql(u8, arg, "--no-labels")) {
+            config.no_labels = true;
+        } else if (std.mem.eql(u8, arg, "--result-only")) {
+            config.result_only = true;
         } else if (std.mem.eql(u8, arg, "--seed") or std.mem.eql(u8, arg, "-s")) {
             i += 1;
             if (i >= args.len) {
@@ -250,9 +258,13 @@ fn run() !void {
 
     // First pass: parse all expressions and find max values for padding
     var max_sides: u32 = 0;
+    var max_label_len: usize = 0;
     var parsed_exprs: std.ArrayList(parser.Expr) = .{};
     defer parsed_exprs.deinit(allocator);
     var has_errors = false;
+
+    // Buffer for formatting expressions to measure label length
+    var label_buf: [128]u8 = undefined;
 
     for (config.dice_specs) |spec_str| {
         const expr = parser.parse(spec_str) catch |parse_err| {
@@ -287,6 +299,14 @@ fn run() !void {
                     max_sides = op.value.dice.sides;
                 }
             }
+        }
+
+        // Calculate label length for this expression
+        var label_stream = std.io.fixedBufferStream(&label_buf);
+        formatExpr(label_stream.writer(), expr) catch {};
+        const label_len = label_stream.pos;
+        if (label_len > max_label_len) {
+            max_label_len = label_len;
         }
 
         try parsed_exprs.append(allocator, expr);
@@ -337,30 +357,63 @@ fn run() !void {
         // Get color group for this row (cycles every 3 rows)
         const group = color_groups[row_index % color_groups.len];
 
-        // Print the expression label (dim color)
-        stdout_tty.setColor(&out.interface, group.label) catch {};
-        try out.interface.print("[", .{});
-        try formatExpr(&out.interface, expr);
-        try out.interface.print("]", .{});
-        stdout_tty.setColor(&out.interface, .reset) catch {};
+        // Handle --result-only: just print the total
+        if (config.result_only) {
+            stdout_tty.setColor(&out.interface, .bold) catch {};
+            try out.interface.print("{d}", .{result.total});
+            stdout_tty.setColor(&out.interface, .reset) catch {};
+            try out.interface.print("\n", .{});
+            row_index += 1;
+            continue;
+        }
+
+        // Print the expression label (dim color) unless --no-labels
+        if (!config.no_labels) {
+            stdout_tty.setColor(&out.interface, group.label) catch {};
+            try out.interface.print("[", .{});
+
+            // Format the expression to get its length, then pad with underscores
+            var expr_label_stream = std.io.fixedBufferStream(&label_buf);
+            try formatExpr(expr_label_stream.writer(), expr);
+            const expr_len = expr_label_stream.pos;
+            const padding_needed = max_label_len - expr_len;
+
+            // Write underscore padding
+            for (0..padding_needed) |_| {
+                try out.interface.print("_", .{});
+            }
+
+            // Write the expression
+            try out.interface.print("{s}", .{label_buf[0..expr_len]});
+            try out.interface.print("]", .{});
+            stdout_tty.setColor(&out.interface, .reset) catch {};
+        }
 
         // Print dice results
         var die_index: usize = 0;
+        var first_die = true;
         for (result.dice_rolls) |dice_result| {
             for (dice_result.dice_results) |die| {
-                try out.interface.print(" ", .{});
+                // Add space before die (skip for very first die when no_labels)
+                if (!first_die or !config.no_labels) {
+                    try out.interface.print(" ", .{});
+                }
+                first_die = false;
 
                 if (die.kept) {
                     // Normal die result with color
                     const result_color = group.results[die_index % group.results.len];
                     stdout_tty.setColor(&out.interface, result_color) catch {};
-                    try writeRightAligned(&out.interface, die.value, sides_width, ' ');
+                    if (config.no_labels) {
+                        // No padding when labels are omitted
+                        try out.interface.print("{d}", .{die.value});
+                    } else {
+                        try writeRightAligned(&out.interface, die.value, sides_width, ' ');
+                    }
                 } else {
                     // Dropped die - dim with strikethrough styling (~value~)
                     stdout_tty.setColor(&out.interface, .dim) catch {};
-                    try out.interface.print("~", .{});
-                    try out.interface.print("{d}", .{die.value});
-                    try out.interface.print("~", .{});
+                    try out.interface.print("~{d}~", .{die.value});
                 }
 
                 die_index += 1;
