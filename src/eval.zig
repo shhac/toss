@@ -24,17 +24,23 @@ pub const DieResult = struct {
 pub const DiceRollResult = struct {
     dice_results: []const DieResult, // Individual die values
     subtotal: i32, // Sum of kept dice
+    sides: u32 = 0, // Number of sides (0 = Fudge dice)
 
     // Internal storage
     _dice_buf: [MAX_DICE]DieResult = undefined,
     _dice_len: usize = 0,
 
-    /// Sum of all kept dice
+    /// Sum of all kept dice (adjusts for Fudge dice: values 1,2,3 -> -1,0,+1)
     pub fn keptTotal(self: *const DiceRollResult) i32 {
         var total: i32 = 0;
         for (self.dice_results) |die| {
             if (die.kept) {
-                total += @intCast(die.value);
+                if (self.sides == 0) {
+                    // Fudge dice: stored value 1,2,3 maps to -1,0,+1
+                    total += @as(i32, @intCast(die.value)) - 2;
+                } else {
+                    total += @intCast(die.value);
+                }
             }
         }
         return total;
@@ -110,6 +116,7 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
     var result = DiceRollResult{
         .dice_results = &[_]DieResult{},
         .subtotal = 0,
+        .sides = dice.sides,
     };
 
     // Roll all initial dice
@@ -713,4 +720,35 @@ test "evaluate reroll with explode" {
     try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
     // Should have at least 4 dice (maybe more if explosions happened)
     try testing.expect(result.dice_rolls[0].dice_results.len >= 4);
+}
+
+// -----------------------------------------------------------------------------
+// Fudge Dice Tests
+// -----------------------------------------------------------------------------
+
+test "evaluate Fudge dice values in range" {
+    var rng = rng_mod.Rng.init(42);
+    const expr = try parser.parse("4dF");
+    const result = try evaluate(expr, &rng);
+
+    try testing.expectEqual(@as(usize, 1), result.dice_rolls.len);
+    try testing.expectEqual(@as(usize, 4), result.dice_rolls[0].dice_results.len);
+
+    // Fudge dice should produce values 1, 2, or 3 (displayed as -1, 0, +1)
+    for (result.dice_rolls[0].dice_results) |die| {
+        try testing.expect(die.value >= 1 and die.value <= 3);
+    }
+}
+
+test "evaluate Fudge dice total is sum minus 2 per die" {
+    var rng = rng_mod.Rng.init(12345);
+    const expr = try parser.parse("4dF");
+    const result = try evaluate(expr, &rng);
+
+    // Calculate expected total: sum of (value - 2) for each die
+    var expected_total: i32 = 0;
+    for (result.dice_rolls[0].dice_results) |die| {
+        expected_total += @as(i32, @intCast(die.value)) - 2;
+    }
+    try testing.expectEqual(expected_total, result.total);
 }

@@ -56,7 +56,8 @@ toss --help
 
 The CLI follows standard Zig patterns:
 - `src/main.zig` - Entry point, argument parsing, output formatting, colors
-- `src/dice.zig` - Dice notation parsing (`2d6` -> `{count: 2, sides: 6}`)
+- `src/parser.zig` - Dice notation parsing (`2d6` -> `{count: 2, sides: 6}`)
+- `src/eval.zig` - Expression evaluation, dice rolling, modifier application
 - `src/rng.zig` - Seedable RNG wrapper with OS entropy fallback
 - `scripts/release.sh` - Cross-platform release build script
 

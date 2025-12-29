@@ -153,6 +153,23 @@ fn writeRightAligned(writer: anytype, value: u32, width: usize, pad_char: u8) !v
     try writer.print("{d}", .{value});
 }
 
+/// Format a Fudge die value (stored as 1, 2, 3) for display as -1, 0, +1
+fn formatFudgeValue(writer: anytype, value: u32, width: usize) !void {
+    // Fudge dice: 1 -> "-1", 2 -> " 0", 3 -> "+1"
+    const display_str: []const u8 = switch (value) {
+        1 => "-1",
+        2 => " 0",
+        3 => "+1",
+        else => "??", // Should never happen
+    };
+    // Pad to width (Fudge display is always 2 chars)
+    const display_width: usize = 2;
+    for (0..(width -| display_width)) |_| {
+        try writer.writeByte(' ');
+    }
+    try writer.print("{s}", .{display_str});
+}
+
 /// Format an expression for display (reconstructs the original notation)
 fn formatExpr(writer: anytype, expr: parser.Expr) !void {
     try formatExprValue(writer, expr.base);
@@ -450,7 +467,15 @@ fn run() !void {
                     // Normal die result with color
                     const result_color = group.results[die_index % group.results.len];
                     stdout_tty.setColor(&out.interface, result_color) catch {};
-                    if (config.no_labels) {
+                    if (dice_result.sides == 0) {
+                        // Fudge dice: display as -1, 0, +1
+                        if (config.no_labels) {
+                            // No padding when labels are omitted
+                            try formatFudgeValue(&out.interface, die.value, 0);
+                        } else {
+                            try formatFudgeValue(&out.interface, die.value, sides_width);
+                        }
+                    } else if (config.no_labels) {
                         // No padding when labels are omitted
                         try out.interface.print("{d}", .{die.value});
                     } else {
@@ -463,7 +488,18 @@ fn run() !void {
                 } else {
                     // Dropped die - dim with strikethrough styling (~value~)
                     stdout_tty.setColor(&out.interface, .dim) catch {};
-                    try out.interface.print("~{d}~", .{die.value});
+                    if (dice_result.sides == 0) {
+                        // Fudge dice: display as -1, 0, +1 with strikethrough
+                        const fudge_str: []const u8 = switch (die.value) {
+                            1 => "-1",
+                            2 => " 0",
+                            3 => "+1",
+                            else => "??",
+                        };
+                        try out.interface.print("~{s}~", .{fudge_str});
+                    } else {
+                        try out.interface.print("~{d}~", .{die.value});
+                    }
                     // Mark dropped exploded dice too
                     if (die.exploded) {
                         try out.interface.print("*", .{});
