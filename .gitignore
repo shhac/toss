@@ -1,6 +1,10 @@
 dist
 .ai-cache/
 
+# Zig
+.zig-cache/
+zig-out/
+
 # Testing
 coverage
 test-results

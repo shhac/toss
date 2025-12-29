@@ -42,6 +42,8 @@ toss --help
 
 The CLI follows standard Zig patterns:
 - `src/main.zig` - Entry point, argument parsing, output formatting
+- `src/dice.zig` - Dice notation parsing (`2d6` -> `{count: 2, sides: 6}`)
+- `src/rng.zig` - Seedable RNG wrapper with OS entropy fallback
 - Dice notation parsing: `<count>d<sides>` format (e.g., `2d6` = roll two 6-sided dice)
 - Uses Zig's `std.Random` for RNG with optional seeding
 - `--show-seed` outputs to stderr to keep stdout clean for scripting
