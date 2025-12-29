@@ -179,7 +179,8 @@ fn run() !void {
         try err.interface.flush();
     }
 
-    // First pass: parse all dice specs and find max sides value
+    // First pass: parse all dice specs and find max count/sides values
+    var max_count: u32 = 0;
     var max_sides: u32 = 0;
     var parsed_specs: std.ArrayList(dice.DiceSpec) = .{};
     defer parsed_specs.deinit(allocator);
@@ -201,13 +202,17 @@ fn run() !void {
             continue;
         };
 
+        if (spec.count > max_count) {
+            max_count = spec.count;
+        }
         if (spec.sides > max_sides) {
             max_sides = spec.sides;
         }
         try parsed_specs.append(allocator, spec);
     }
 
-    // Calculate the width needed for the max sides value
+    // Calculate the width needed for the max count and sides values
+    const count_width = digitCount(max_count);
     const sides_width = digitCount(max_sides);
 
     // Second pass: output with padding
@@ -224,9 +229,11 @@ fn run() !void {
         const group = color_groups[row_index % color_groups.len];
 
         // Print the dice spec label with padding (dim color)
-        // Format: [<count>d<padded_sides>]
+        // Format: [<padded_count>d<padded_sides>]
         stdout_tty.setColor(&out.interface, group.label) catch {};
-        try out.interface.print("[{d}d", .{spec.count});
+        try out.interface.print("[", .{});
+        try writeRightAligned(&out.interface, spec.count, count_width);
+        try out.interface.print("d", .{});
         try writeRightAligned(&out.interface, spec.sides, sides_width);
         try out.interface.print("]", .{});
         stdout_tty.setColor(&out.interface, .reset) catch {};
