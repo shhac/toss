@@ -3,7 +3,7 @@ const parser = @import("parser.zig");
 const eval = @import("eval.zig");
 const rng_mod = @import("rng.zig");
 
-const version = "0.5.0";
+const version = "0.5.1";
 
 const help_text =
     \\toss - A dice rolling CLI
@@ -471,6 +471,7 @@ fn run() !void {
                 if (die.kept) {
                     // Normal die result with color
                     const result_color = group.results[die_index % group.results.len];
+                    stdout_tty.setColor(&out.interface, .reset) catch {};
                     stdout_tty.setColor(&out.interface, result_color) catch {};
                     // Show reroll history if enabled and there was a reroll
                     if (config.show_rerolls and die._reroll_count > 0) {
@@ -515,6 +516,7 @@ fn run() !void {
                     if (die.exploded) {
                         try out.interface.print("*", .{});
                     }
+                    stdout_tty.setColor(&out.interface, .reset) catch {};
                 }
 
                 die_index += 1;
