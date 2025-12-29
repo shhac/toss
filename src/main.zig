@@ -97,12 +97,12 @@ fn digitCount(n: u32) usize {
     return count;
 }
 
-/// Write a right-aligned number with the given width
-fn writeRightAligned(writer: anytype, value: u32, width: usize) !void {
+/// Write a right-aligned number with the given width and padding character
+fn writeRightAligned(writer: anytype, value: u32, width: usize, pad_char: u8) !void {
     const value_width = digitCount(value);
-    // Add leading spaces for alignment
+    // Add leading padding for alignment
     for (0..(width -| value_width)) |_| {
-        try writer.print(" ", .{});
+        try writer.writeByte(pad_char);
     }
     try writer.print("{d}", .{value});
 }
@@ -232,9 +232,9 @@ fn run() !void {
         // Format: [<padded_count>d<padded_sides>]
         stdout_tty.setColor(&out.interface, group.label) catch {};
         try out.interface.print("[", .{});
-        try writeRightAligned(&out.interface, spec.count, count_width);
+        try writeRightAligned(&out.interface, spec.count, count_width, '_');
         try out.interface.print("d", .{});
-        try writeRightAligned(&out.interface, spec.sides, sides_width);
+        try writeRightAligned(&out.interface, spec.sides, sides_width, '_');
         try out.interface.print("]", .{});
         stdout_tty.setColor(&out.interface, .reset) catch {};
 
@@ -244,7 +244,7 @@ fn run() !void {
             const result_color = group.results[die_index % group.results.len];
             stdout_tty.setColor(&out.interface, result_color) catch {};
             try out.interface.print(" ", .{});
-            try writeRightAligned(&out.interface, result, sides_width);
+            try writeRightAligned(&out.interface, result, sides_width, ' ');
         }
 
         stdout_tty.setColor(&out.interface, .reset) catch {};
