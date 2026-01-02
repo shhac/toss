@@ -4,14 +4,22 @@ A fast dice rolling CLI written in Zig.
 
 ## Installation
 
-```bash
-# Build from source
-zig build -Doptimize=ReleaseSmall
+### Homebrew (macOS/Linux)
 
+```bash
+brew install shhac/tap/toss
+```
+
+### From Source
+
+```bash
+zig build -Doptimize=ReleaseSmall
 # Binary will be at zig-out/bin/toss
 ```
 
-Or download a pre-built binary from [Releases](https://github.com/shhac/toss/releases).
+### Pre-built Binaries
+
+Download from [Releases](https://github.com/shhac/toss/releases).
 
 ## Usage
 
