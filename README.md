@@ -4,6 +4,8 @@ A fast dice rolling CLI written in Zig.
 
 **Website:** [toss.paulie.app](https://toss.paulie.app/)
 
+![Demo](assets/demo.gif)
+
 ## Installation
 
 ### Homebrew (macOS/Linux)
