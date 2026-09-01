@@ -72,3 +72,4 @@ The CLI follows standard Zig patterns:
 - Respects `NO_COLOR` environment variable
 - Results to stdout, diagnostics (seed, errors) to stderr
 - Aligned output with underscore padding in labels for awk compatibility
+- Dropped dice use ANSI strikethrough on a terminal, `~N~` when piped or NO_COLOR

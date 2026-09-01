@@ -146,6 +146,27 @@ pub fn labelWidth(expr: parser.Expr) usize {
     return stream.end;
 }
 
+/// SGR 9 / 29. `std.Io.Terminal` has no strikethrough colour, and these are
+/// only emitted where escape codes are already in use.
+const strike_on = "\x1b[9m";
+const strike_off = "\x1b[29m";
+
+fn usesEscapeCodes(term: std.Io.Terminal) bool {
+    return switch (term.mode) {
+        .escape_codes => true,
+        else => false,
+    };
+}
+
+/// Write a die's value, right-aligned to `width` (0 for no padding).
+fn writeDieValue(out: *std.Io.Writer, value: u32, is_fudge: bool, width: usize) !void {
+    if (is_fudge) {
+        try out.print("{s:[1]}", .{ fudgeDisplay(value), width });
+    } else {
+        try out.print("{d:[1]}", .{ value, width });
+    }
+}
+
 fn renderDie(
     out: *std.Io.Writer,
     term: std.Io.Terminal,
@@ -155,9 +176,19 @@ fn renderDie(
     color: std.Io.Terminal.Color,
     layout: Layout,
 ) !void {
+    // Labels are what the columns align to, so drop the padding without them.
+    const width: usize = if (opts.no_labels) 0 else layout.sides_width;
+
     if (!die.kept) {
         term.setColor(.dim) catch {};
-        if (is_fudge) {
+        // A terminal can strike the value through directly. Anywhere else --
+        // piped output, NO_COLOR -- keeps the ~N~ marker, which is what any
+        // consumer parsing this output already looks for.
+        if (usesEscapeCodes(term)) {
+            try out.writeAll(strike_on);
+            try writeDieValue(out, die.value, is_fudge, width);
+            try out.writeAll(strike_off);
+        } else if (is_fudge) {
             try out.print("~{s}~", .{fudgeDisplay(die.value)});
         } else {
             try out.print("~{d}~", .{die.value});
@@ -174,13 +205,7 @@ fn renderDie(
             try out.print("{d},", .{hist_val});
         }
     }
-    // Labels are what the columns align to, so drop the padding without them.
-    const width: usize = if (opts.no_labels) 0 else layout.sides_width;
-    if (is_fudge) {
-        try out.print("{s:[1]}", .{ fudgeDisplay(die.value), width });
-    } else {
-        try out.print("{d:[1]}", .{ die.value, width });
-    }
+    try writeDieValue(out, die.value, is_fudge, width);
     if (die.exploded) try out.print("*", .{});
 }
 
@@ -432,4 +457,49 @@ test "renderRow with no_labels omits the label and the padding" {
 
 test "renderRow with result_only prints just the total" {
     try expectRendered("7\n", "2d6", 6, &.{ .{ .value = 3 }, .{ .value = 4 } }, true, .{ .result_only = true }, wide);
+}
+
+fn renderToBuf(buf: []u8, mode: std.Io.Terminal.Mode, notation: []const u8, sides: u32, dice: []const TestDie) ![]const u8 {
+    var stream: std.Io.Writer = .fixed(buf);
+    const term: std.Io.Terminal = .{ .writer = &stream, .mode = mode };
+    const expr = try parser.parse(notation);
+    const result = rollResultWith(sides, dice, true);
+    try renderRow(&stream, term, .{}, color_groups[0], expr, &result, .{ .sides_width = 1, .max_label_len = 5 });
+    return stream.buffered();
+}
+
+test "a terminal strikes dropped dice through instead of using tildes" {
+    var buf: [512]u8 = undefined;
+    const out = try renderToBuf(&buf, .escape_codes, "2d6", 6, &.{
+        .{ .value = 5 },
+        .{ .value = 1, .kept = false },
+    });
+
+    try testing.expect(std.mem.indexOf(u8, out, strike_on) != null);
+    try testing.expect(std.mem.indexOf(u8, out, strike_off) != null);
+    // The tilde marker is the fallback for output that cannot be styled.
+    try testing.expect(std.mem.indexOfScalar(u8, out, '~') == null);
+}
+
+test "output without escape codes keeps the tilde marker" {
+    var buf: [512]u8 = undefined;
+    const out = try renderToBuf(&buf, .no_color, "2d6", 6, &.{
+        .{ .value = 5 },
+        .{ .value = 1, .kept = false },
+    });
+
+    try testing.expectEqualStrings("[__2d6] 5 ~1~ = 5\n", out);
+    try testing.expect(std.mem.indexOf(u8, out, strike_on) == null);
+}
+
+test "struck fudge dice keep their sign column" {
+    var buf: [512]u8 = undefined;
+    const out = try renderToBuf(&buf, .escape_codes, "2dF", 0, &.{
+        .{ .value = 3 },
+        .{ .value = 2, .kept = false },
+    });
+
+    // The dropped die renders as the plain fudge display, struck through --
+    // no tildes wrapping a padded value.
+    try testing.expect(std.mem.indexOf(u8, out, strike_on ++ " 0" ++ strike_off) != null);
 }
