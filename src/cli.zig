@@ -2,7 +2,7 @@
 
 const std = @import("std");
 
-pub const version = "0.5.1";
+pub const version = @import("build_options").version;
 
 pub const help_text =
     \\toss - A dice rolling CLI

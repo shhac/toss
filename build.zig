@@ -1,6 +1,13 @@
 const std = @import("std");
 
+/// The manifest is the single source of truth for the version; the binary and
+/// the release script both read it from here rather than keeping their own copy.
+const version = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -11,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .strip = true,
         .single_threaded = true,
     });
+    root_module.addOptions("build_options", build_options);
 
     const exe = b.addExecutable(.{
         .name = "toss",
@@ -33,6 +41,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    test_module.addOptions("build_options", build_options);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,

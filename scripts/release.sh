@@ -1,7 +1,12 @@
 #!/bin/bash
 set -e
 
-VERSION="0.5.1"
+# Single source of truth: the package manifest.
+VERSION="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' "$(dirname "$0")/../build.zig.zon")"
+if [ -z "${VERSION}" ]; then
+    echo "error: could not read .version from build.zig.zon" >&2
+    exit 1
+fi
 
 # Target platforms
 TARGETS=(
