@@ -172,10 +172,12 @@ fn run(init: std.process.Init) !void {
         .result_only = config.result_only,
     };
 
+    var failed = measured.has_errors;
     var row_index: usize = 0;
     for (parsed_exprs.items) |expr| {
         const result = eval.evaluate(expr, &rng) catch |eval_err| {
             try reportEvalError(err_out, stderr_term, eval_err);
+            failed = true;
             continue;
         };
         const group = render.color_groups[row_index % render.color_groups.len];
@@ -184,6 +186,10 @@ fn run(init: std.process.Init) !void {
     }
 
     try out.flush();
+
+    // Any spec that failed to parse or evaluate makes the whole run a failure,
+    // so callers can branch on the exit status.
+    if (failed) std.process.exit(1);
 }
 
 pub fn main(init: std.process.Init) void {
