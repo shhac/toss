@@ -14,25 +14,43 @@ const Measured = struct {
     has_errors: bool = false,
 };
 
+/// " at position N" when the parser stopped on a specific character, so the
+/// message points at the problem rather than just naming the whole input.
+fn writeErrorLocation(err_out: *std.Io.Writer, diag: parser.Diagnostic) !void {
+    const found = diag.found orelse return;
+    if (std.ascii.isPrint(found)) {
+        try err_out.print(" (at position {d}: '{c}')", .{ diag.pos + 1, found });
+    } else {
+        try err_out.print(" (at position {d}: byte 0x{x:0>2})", .{ diag.pos + 1, found });
+    }
+}
+
 fn reportParseError(
     err_out: *std.Io.Writer,
     term: std.Io.Terminal,
     spec_str: []const u8,
     parse_err: parser.ParseError,
+    diag: parser.Diagnostic,
 ) !void {
     term.setColor(.red) catch {};
     try err_out.print("Error: ", .{});
     term.setColor(.reset) catch {};
     switch (parse_err) {
-        error.InvalidFormat => try err_out.print("Invalid dice format '{s}' (expected NdN, e.g., 2d6)\n", .{spec_str}),
-        error.InvalidCount => try err_out.print("Invalid dice count in '{s}'\n", .{spec_str}),
-        error.InvalidSides => try err_out.print("Invalid sides in '{s}'\n", .{spec_str}),
-        error.Overflow => try err_out.print("Number too large in '{s}'\n", .{spec_str}),
-        error.UnexpectedCharacter => try err_out.print("Unexpected character in '{s}'\n", .{spec_str}),
-        error.UnexpectedEndOfInput => try err_out.print("Unexpected end of input in '{s}'\n", .{spec_str}),
-        error.TooManyOperations => try err_out.print("Too many operations in '{s}'\n", .{spec_str}),
-        error.InvalidModifier => try err_out.print("Invalid modifier in '{s}'\n", .{spec_str}),
+        error.InvalidFormat => try err_out.print("Invalid dice format '{s}'", .{spec_str}),
+        error.InvalidCount => try err_out.print("Invalid dice count in '{s}'", .{spec_str}),
+        error.InvalidSides => try err_out.print("Invalid sides in '{s}'", .{spec_str}),
+        error.Overflow => try err_out.print("Number too large in '{s}'", .{spec_str}),
+        error.UnexpectedCharacter => try err_out.print("Unexpected character in '{s}'", .{spec_str}),
+        error.UnexpectedEndOfInput => try err_out.print("Unexpected end of input in '{s}'", .{spec_str}),
+        error.TooManyOperations => try err_out.print("Too many operations in '{s}'", .{spec_str}),
+        error.InvalidModifier => try err_out.print("Invalid modifier in '{s}'", .{spec_str}),
     }
+    try writeErrorLocation(err_out, diag);
+    // The shape hint reads better after the location than before it.
+    if (parse_err == error.InvalidFormat) {
+        try err_out.print("; expected NdN, e.g., 2d6", .{});
+    }
+    try err_out.print("\n", .{});
     try err_out.flush();
 }
 
@@ -78,8 +96,9 @@ fn parseAndMeasure(
 ) !Measured {
     var measured: Measured = .{};
     for (dice_specs) |spec_str| {
-        const expr = parser.parse(spec_str) catch |parse_err| {
-            try reportParseError(err_out, term, spec_str, parse_err);
+        var diag: parser.Diagnostic = .{};
+        const expr = parser.parseTraced(spec_str, &diag) catch |parse_err| {
+            try reportParseError(err_out, term, spec_str, parse_err, diag);
             measured.has_errors = true;
             continue;
         };

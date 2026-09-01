@@ -134,6 +134,14 @@ const Parser = struct {
     input: []const u8,
     pos: usize,
 
+    /// Where this parser currently stands, for error reporting.
+    fn diagnostic(self: *const Parser) Diagnostic {
+        return .{
+            .pos = self.pos,
+            .found = if (self.pos < self.input.len) self.input[self.pos] else null,
+        };
+    }
+
     /// Initialize parser with input string
     pub fn init(input: []const u8) Parser {
         return .{
@@ -505,16 +513,36 @@ const Parser = struct {
 // =============================================================================
 
 /// Parse a dice notation string into an expression
+/// Where parsing stopped, for error messages that can point at the problem.
+pub const Diagnostic = struct {
+    /// Byte offset at which parsing gave up.
+    pos: usize = 0,
+    /// The byte at `pos`, or null when the input simply ran out.
+    found: ?u8 = null,
+};
+
 pub fn parse(input: []const u8) ParseError!Expr {
+    return parseTraced(input, null);
+}
+
+/// As `parse`, but records where parsing stopped into `diag` on failure.
+pub fn parseTraced(input: []const u8, diag: ?*Diagnostic) ParseError!Expr {
     if (input.len == 0) {
         return error.InvalidFormat;
     }
 
     var parser = Parser.init(input);
+    errdefer if (diag) |d| {
+        d.* = parser.diagnostic();
+    };
+
     const expr = try parser.parseExpression();
 
     // Ensure we consumed all input (Phase 1: no trailing characters)
     if (!parser.isAtEnd()) {
+        if (diag) |d| {
+            d.* = parser.diagnostic();
+        }
         return error.UnexpectedCharacter;
     }
 
@@ -1272,4 +1300,46 @@ test "parse rejects more operations than the buffer holds" {
     for (0..MAX_OPERATIONS + 1) |_| try stream.print("+1", .{});
 
     try testing.expectError(error.TooManyOperations, parse(stream.buffered()));
+}
+
+fn expectDiagnostic(expected_pos: usize, expected_found: ?u8, input: []const u8) !void {
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.UnexpectedCharacter, parseTraced(input, &diag));
+    try testing.expectEqual(expected_pos, diag.pos);
+    try testing.expectEqual(expected_found, diag.found);
+}
+
+test "parseTraced records where a trailing character was found" {
+    try expectDiagnostic(3, 'x', "2d6x");
+    try expectDiagnostic(6, '!', "2d10!!!");
+}
+
+test "parseTraced records where a malformed term begins" {
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidFormat, parseTraced("ad6", &diag));
+    try testing.expectEqual(@as(usize, 0), diag.pos);
+    try testing.expectEqual(@as(?u8, 'a'), diag.found);
+
+    diag = .{};
+    try testing.expectError(error.InvalidFormat, parseTraced(" 2d6", &diag));
+    try testing.expectEqual(@as(usize, 0), diag.pos);
+    try testing.expectEqual(@as(?u8, ' '), diag.found);
+}
+
+test "parseTraced reports no character when the input runs out" {
+    var diag: Diagnostic = .{};
+    try testing.expectError(error.InvalidSides, parseTraced("2d", &diag));
+    try testing.expectEqual(@as(?u8, null), diag.found);
+}
+
+test "parseTraced leaves the diagnostic untouched on success" {
+    var diag: Diagnostic = .{ .pos = 99, .found = 'z' };
+    _ = try parseTraced("2d6", &diag);
+    try testing.expectEqual(@as(usize, 99), diag.pos);
+}
+
+test "parse works without a diagnostic" {
+    const expr = try parse("4d6k3");
+    try testing.expectEqual(@as(u32, 4), expr.base.dice.count);
+    try testing.expectError(error.InvalidFormat, parse("zzz"));
 }
