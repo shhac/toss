@@ -62,10 +62,29 @@ toss 1d6 2d100
 # [2d100]  42  87
 
 # Options
-toss --seed 42 2d6  # Reproducible rolls
-toss --show-seed 1d20
-toss --no-labels 2d6
-toss --result-only 4d6k3
+toss --seed 42 2d6      # Reproducible rolls
+toss --show-seed 1d20   # Print the seed used (to stderr)
+toss --show-rerolls 2d6r1  # Show what each die was rerolled from
+toss --no-labels 2d6    # Omit the [expr] prefix
+toss --result-only 4d6k3   # Print only the total
+```
+
+Dropped dice are struck through in a terminal, and written as `~4~` when
+output is piped or `NO_COLOR` is set:
+
+```bash
+toss 4d6k3 | cat
+# [4d6k3] 6 5 4 ~1~ = 15
+```
+
+## Exit status
+
+`0` on success, `1` if any expression fails to parse or evaluate. Rolls that
+did succeed are still printed, so a partial failure both reports the good rows
+and signals failure:
+
+```bash
+toss 2d6 nonsense && echo "all ok"   # prints the 2d6 row, then exits 1
 ```
 
 ## Features
