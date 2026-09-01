@@ -5,14 +5,6 @@ on:
     tags:
       - 'v*'
 
-# mlugg/setup-zig still declares `using: node20`, and its latest release
-# (v2.2.1) has no node24 build yet. This pins the runtime to Node 24 now
-# rather than inheriting whatever the runner defaults to. It does not
-# silence the deprecation annotation -- that fires off the action's own
-# declared runtime (actions/runner#4295) and clears when setup-zig ships
-# a node24 release, or when Node 20 is removed on 2026-09-23.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-release:
@@ -23,7 +15,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        uses: shhac/setup-zig@215585c45325702506a3e8d6f4c9319073668d5f # v2.2.1-node24
         with:
           version: '0.16.0'
 
