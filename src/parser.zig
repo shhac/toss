@@ -32,27 +32,14 @@ pub const Operation = struct {
 /// Example: 2d6+5-2 -> base=dice(2d6), operations=[{add, 5}, {sub, 2}]
 pub const Expr = struct {
     base: ExprValue, // First term
-    operations: []const Operation, // Subsequent operations (may be empty)
     // Internal storage for operations (used by parser)
     _operations_buf: [MAX_OPERATIONS]Operation = undefined,
     _operations_len: usize = 0,
 
-    /// Create an expression from just a base value (no operations)
-    pub fn fromValue(value: ExprValue) Expr {
-        return .{
-            .base = value,
-            .operations = &[_]Operation{},
-        };
-    }
-
-    /// Create an expression from a dice roll
-    pub fn fromDice(dice: DiceRoll) Expr {
-        return fromValue(.{ .dice = dice });
-    }
-
-    /// Create an expression from a number
-    pub fn fromNumber(num: i32) Expr {
-        return fromValue(.{ .number = num });
+    /// Subsequent operations, in order (may be empty).
+    /// Derived on demand so the slice survives copying the struct by value.
+    pub fn operations(self: *const Expr) []const Operation {
+        return self._operations_buf[0..self._operations_len];
     }
 };
 
@@ -135,8 +122,6 @@ pub const ParseError = error{
     UnexpectedEndOfInput,
     /// Too many operations in expression (exceeds MAX_OPERATIONS)
     TooManyOperations,
-    /// Division by zero in expression
-    DivisionByZero,
     /// Modifier is invalid (e.g., keep/drop count is zero or exceeds dice count)
     InvalidModifier,
 };
@@ -220,10 +205,7 @@ const Parser = struct {
         }
 
         // Must be a number
-        const sides = self.parseUnsigned() catch |err| switch (err) {
-            error.UnexpectedCharacter => return error.InvalidSides,
-            else => return err,
-        };
+        const sides = try self.parseUnsignedOr(error.InvalidSides);
 
         if (sides == 0) return error.InvalidSides;
 
@@ -292,41 +274,53 @@ const Parser = struct {
         return .{ .number = num };
     }
 
+    /// Parse an unsigned number, reporting `on_missing` when one isn't there.
+    fn parseUnsignedOr(self: *Parser, comptime on_missing: ParseError) ParseError!u32 {
+        return self.parseUnsigned() catch |err| switch (err) {
+            error.UnexpectedCharacter => on_missing,
+            else => err,
+        };
+    }
+
+    /// Parse an unsigned number, or rewind to `saved_pos` and return null when
+    /// there isn't one -- used where a 'd' may start a modifier or a new term.
+    fn parseUnsignedOrRewind(self: *Parser, saved_pos: usize) ParseError!?u32 {
+        return self.parseUnsigned() catch |err| switch (err) {
+            error.UnexpectedCharacter => {
+                self.pos = saved_pos;
+                return null;
+            },
+            else => err,
+        };
+    }
+
+    /// A keep/drop count must name at least one die and no more than were rolled.
+    fn validateModifierCount(count: u32, dice_count: u32) ParseError!void {
+        if (count == 0 or count > dice_count) return error.InvalidModifier;
+    }
+
     /// Parse a comparison point (=N, >N, <N, >=N, <=N)
     /// Returns null if no comparison point found
     fn parseComparePoint(self: *Parser) ParseError!?ComparePoint {
         const c = self.peek() orelse return null;
 
-        var op: CompareOp = undefined;
-
-        if (c == '=') {
-            _ = self.advance();
-            op = .eq;
-        } else if (c == '>') {
-            _ = self.advance();
-            if (self.matchChar('=')) {
-                op = .gte;
-            } else {
-                op = .gt;
-            }
-        } else if (c == '<') {
-            _ = self.advance();
-            if (self.matchChar('=')) {
-                op = .lte;
-            } else {
-                op = .lt;
-            }
-        } else {
-            return null;
-        }
-
-        // Parse the value
-        const value = self.parseUnsigned() catch |err| switch (err) {
-            error.UnexpectedCharacter => return error.InvalidModifier,
-            else => return err,
+        const op: CompareOp = switch (c) {
+            '=' => blk: {
+                _ = self.advance();
+                break :blk .eq;
+            },
+            '>' => blk: {
+                _ = self.advance();
+                break :blk if (self.matchChar('=')) .gte else .gt;
+            },
+            '<' => blk: {
+                _ = self.advance();
+                break :blk if (self.matchChar('=')) .lte else .lt;
+            },
+            else => return null,
         };
 
-        return .{ .op = op, .value = value };
+        return .{ .op = op, .value = try self.parseUnsignedOr(error.InvalidModifier) };
     }
 
     /// Parse an explode modifier (!, !!, !p) with optional compare point
@@ -374,11 +368,7 @@ const Parser = struct {
             // Check if there's a bare number (e.g., r1 means reroll on 1)
             const c = self.peek();
             if (c != null and std.ascii.isDigit(c.?)) {
-                const value = self.parseUnsigned() catch |err| switch (err) {
-                    error.UnexpectedCharacter => return error.InvalidModifier,
-                    else => return err,
-                };
-                config.compare = .{ .op = .eq, .value = value };
+                config.compare = .{ .op = .eq, .value = try self.parseUnsignedOr(error.InvalidModifier) };
             }
             // If no compare point and no bare number, config.compare stays null (default: reroll 1s)
         }
@@ -388,103 +378,55 @@ const Parser = struct {
 
     /// Parse a keep/drop modifier (k, kh, kl, d, dh, dl)
     /// Returns null if no modifier found at current position
-    /// The tricky part: 'd' after sides could be drop modifier OR start of new expression
-    /// We resolve this by: if 'd' is followed by a digit, it's drop modifier
+    /// Parse a keep/drop modifier, if one follows.
+    ///
+    /// The tricky part: a 'd' after the sides could start a drop modifier or a
+    /// new expression, so the drop half rewinds when it doesn't find a count.
     fn parseModifier(self: *Parser, dice_count: u32) ParseError!?KeepDrop {
         const c = self.peek() orelse return null;
+        if (c == 'k' or c == 'K') return try self.parseKeepModifier(dice_count);
+        if (c == 'd' or c == 'D') return try self.parseDropModifier(dice_count);
+        return null;
+    }
 
-        // Check for 'k' (keep) modifiers
-        if (c == 'k' or c == 'K') {
-            _ = self.advance();
+    /// k / kh = keep highest, kl = keep lowest.
+    fn parseKeepModifier(self: *Parser, dice_count: u32) ParseError!?KeepDrop {
+        _ = self.advance(); // consume 'k'
 
-            // Check for 'h' (high) or 'l' (low) suffix
-            const next = self.peek();
-            const is_lowest = if (next) |n| (n == 'l' or n == 'L') else false;
-
-            if (is_lowest) {
-                _ = self.advance(); // consume 'l'
-                const count = self.parseUnsigned() catch |err| switch (err) {
-                    error.UnexpectedCharacter => return error.InvalidModifier,
-                    else => return err,
-                };
-                if (count == 0 or count > dice_count) return error.InvalidModifier;
-                return .{ .keep_lowest = count };
-            } else {
-                // 'k' or 'kh' both mean keep highest
-                if (next) |n| {
-                    if (n == 'h' or n == 'H') {
-                        _ = self.advance(); // consume optional 'h'
-                    }
-                }
-                const count = self.parseUnsigned() catch |err| switch (err) {
-                    error.UnexpectedCharacter => return error.InvalidModifier,
-                    else => return err,
-                };
-                if (count == 0 or count > dice_count) return error.InvalidModifier;
-                return .{ .keep_highest = count };
-            }
+        const next = self.peek();
+        const is_lowest = if (next) |n| (n == 'l' or n == 'L') else false;
+        if (is_lowest or (next != null and (next.? == 'h' or next.? == 'H'))) {
+            _ = self.advance(); // consume the explicit 'l' or 'h'
         }
 
-        // Check for 'd' (drop) modifiers
-        // Key insight: 'd' followed by digit is drop modifier, otherwise not a modifier
-        if (c == 'd' or c == 'D') {
-            // Look ahead to see if this is a drop modifier or something else
-            const saved_pos = self.pos;
+        const count = try self.parseUnsignedOr(error.InvalidModifier);
+        try validateModifierCount(count, dice_count);
+        return if (is_lowest) .{ .keep_lowest = count } else .{ .keep_highest = count };
+    }
 
-            _ = self.advance(); // consume 'd'
-            const next = self.peek();
+    /// dh = drop highest; d / dl = drop lowest. Returns null (having rewound)
+    /// when the 'd' turns out to begin a new dice term instead.
+    fn parseDropModifier(self: *Parser, dice_count: u32) ParseError!?KeepDrop {
+        const saved_pos = self.pos;
+        _ = self.advance(); // consume 'd'
 
-            // Check for 'h' (high) suffix - drop highest
-            if (next) |n| {
-                if (n == 'h' or n == 'H') {
-                    _ = self.advance(); // consume 'h'
-                    const count = self.parseUnsigned() catch |err| switch (err) {
-                        error.UnexpectedCharacter => {
-                            // Not a valid modifier, restore position
-                            self.pos = saved_pos;
-                            return null;
-                        },
-                        else => return err,
-                    };
-                    if (count == 0 or count > dice_count) return error.InvalidModifier;
-                    return .{ .drop_highest = count };
-                }
-            }
+        const next = self.peek() orelse {
+            self.pos = saved_pos;
+            return null;
+        };
 
-            // Check for 'l' (low) suffix or bare digit - both mean drop lowest
-            if (next) |n| {
-                if (n == 'l' or n == 'L') {
-                    _ = self.advance(); // consume 'l'
-                    const count = self.parseUnsigned() catch |err| switch (err) {
-                        error.UnexpectedCharacter => {
-                            // Not a valid modifier, restore position
-                            self.pos = saved_pos;
-                            return null;
-                        },
-                        else => return err,
-                    };
-                    if (count == 0 or count > dice_count) return error.InvalidModifier;
-                    return .{ .drop_lowest = count };
-                } else if (std.ascii.isDigit(n)) {
-                    // 'd' followed by digit = drop lowest (e.g., 4d6d1)
-                    const count = self.parseUnsigned() catch |err| switch (err) {
-                        error.UnexpectedCharacter => {
-                            self.pos = saved_pos;
-                            return null;
-                        },
-                        else => return err,
-                    };
-                    if (count == 0 or count > dice_count) return error.InvalidModifier;
-                    return .{ .drop_lowest = count };
-                }
-            }
-
-            // Not a modifier (e.g., 'd' at end or followed by non-digit)
+        const is_highest = next == 'h' or next == 'H';
+        if (is_highest or next == 'l' or next == 'L') {
+            _ = self.advance(); // consume the explicit 'h' or 'l'
+        } else if (!std.ascii.isDigit(next)) {
+            // 'd' followed by anything else starts a new term, not a modifier.
             self.pos = saved_pos;
             return null;
         }
 
-        return null;
+        const count = try self.parseUnsignedOrRewind(saved_pos) orelse return null;
+        try validateModifierCount(count, dice_count);
+        return if (is_highest) .{ .drop_highest = count } else .{ .drop_lowest = count };
     }
 
     /// Parse a dice roll specification
@@ -492,10 +434,7 @@ const Parser = struct {
         // Parse optional count
         const has_count = if (self.peek()) |c| std.ascii.isDigit(c) else false;
         const count: u32 = if (has_count) blk: {
-            const c = self.parseUnsigned() catch |err| switch (err) {
-                error.UnexpectedCharacter => return error.InvalidCount,
-                else => return err,
-            };
+            const c = try self.parseUnsignedOr(error.InvalidCount);
             if (c == 0) return error.InvalidCount;
             break :blk c;
         } else 1;
@@ -528,14 +467,16 @@ const Parser = struct {
 
     /// Parse a complete expression (Phase 2: base value with optional operations)
     fn parseExpression(self: *Parser) ParseError!Expr {
-        // Parse the base value (first term)
-        const base = try self.parseExprValue();
+        // A malformed first term means the input never looked like dice notation
+        // at all, so report the expected shape rather than leaking the lexer-level
+        // "unexpected character" -- which is only useful once a prefix has parsed.
+        const base = self.parseExprValue() catch |err| switch (err) {
+            error.UnexpectedCharacter => return error.InvalidFormat,
+            else => return err,
+        };
 
         // Create result with internal buffer
-        var result = Expr{
-            .base = base,
-            .operations = &[_]Operation{},
-        };
+        var result = Expr{ .base = base };
 
         // Parse subsequent operations
         while (self.parseOperator()) |op| {
@@ -554,9 +495,6 @@ const Parser = struct {
             };
             result._operations_len += 1;
         }
-
-        // Point slice to populated portion of buffer
-        result.operations = result._operations_buf[0..result._operations_len];
 
         return result;
     }
@@ -660,37 +598,37 @@ fn expectDiceWithExplode(value: ExprValue, expected_count: u32, expected_sides: 
 test "parse standard notation '2d6'" {
     const result = try parse("2d6");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse standard notation '1d20'" {
     const result = try parse("1d20");
     try expectDice(result.base, 1, 20);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse implicit count 'd6'" {
     const result = try parse("d6");
     try expectDice(result.base, 1, 6);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse implicit count 'd20'" {
     const result = try parse("d20");
     try expectDice(result.base, 1, 20);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse large numbers '100d100'" {
     const result = try parse("100d100");
     try expectDice(result.base, 100, 100);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse single die '1d1'" {
     const result = try parse("1d1");
     try expectDice(result.base, 1, 1);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 // -----------------------------------------------------------------------------
@@ -842,103 +780,103 @@ test "error on leading space ' 2d6'" {
 test "parse dice plus number '2d6+5'" {
     const result = try parse("2d6+5");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 5);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 5);
 }
 
 test "parse dice minus number '2d6-3'" {
     const result = try parse("2d6-3");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.sub, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 3);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.sub, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 3);
 }
 
 test "parse dice times number '2d6*2'" {
     const result = try parse("2d6*2");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.mul, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 2);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.mul, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 2);
 }
 
 test "parse dice divide by number '2d6/2'" {
     const result = try parse("2d6/2");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.div, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 2);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.div, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 2);
 }
 
 test "parse dice plus dice '2d6+1d4'" {
     const result = try parse("2d6+1d4");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDice(result.operations[0].value, 1, 4);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDice(result.operations()[0].value, 1, 4);
 }
 
 test "parse dice plus dice implicit count '2d6+d4'" {
     const result = try parse("2d6+d4");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDice(result.operations[0].value, 1, 4);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDice(result.operations()[0].value, 1, 4);
 }
 
 test "parse multiple operations '2d6+5-2'" {
     const result = try parse("2d6+5-2");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 2), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 5);
-    try testing.expectEqual(Op.sub, result.operations[1].op);
-    try expectNumber(result.operations[1].value, 2);
+    try testing.expectEqual(@as(usize, 2), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 5);
+    try testing.expectEqual(Op.sub, result.operations()[1].op);
+    try expectNumber(result.operations()[1].value, 2);
 }
 
 test "parse complex expression '1d20+5+2d4-1'" {
     const result = try parse("1d20+5+2d4-1");
     try expectDice(result.base, 1, 20);
-    try testing.expectEqual(@as(usize, 3), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 5);
-    try testing.expectEqual(Op.add, result.operations[1].op);
-    try expectDice(result.operations[1].value, 2, 4);
-    try testing.expectEqual(Op.sub, result.operations[2].op);
-    try expectNumber(result.operations[2].value, 1);
+    try testing.expectEqual(@as(usize, 3), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 5);
+    try testing.expectEqual(Op.add, result.operations()[1].op);
+    try expectDice(result.operations()[1].value, 2, 4);
+    try testing.expectEqual(Op.sub, result.operations()[2].op);
+    try expectNumber(result.operations()[2].value, 1);
 }
 
 test "parse number as base expression '5'" {
     const result = try parse("5");
     try expectNumber(result.base, 5);
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse number plus dice '5+2d6'" {
     const result = try parse("5+2d6");
     try expectNumber(result.base, 5);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDice(result.operations[0].value, 2, 6);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDice(result.operations()[0].value, 2, 6);
 }
 
 test "parse number plus number '5+3'" {
     const result = try parse("5+3");
     try expectNumber(result.base, 5);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 3);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 3);
 }
 
 test "parse mixed operations '2d6*2+1d4'" {
     const result = try parse("2d6*2+1d4");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 2), result.operations.len);
-    try testing.expectEqual(Op.mul, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 2);
-    try testing.expectEqual(Op.add, result.operations[1].op);
-    try expectDice(result.operations[1].value, 1, 4);
+    try testing.expectEqual(@as(usize, 2), result.operations().len);
+    try testing.expectEqual(Op.mul, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 2);
+    try testing.expectEqual(Op.add, result.operations()[1].op);
+    try expectDice(result.operations()[1].value, 1, 4);
 }
 
 test "error on trailing operator '2d6+'" {
@@ -946,11 +884,21 @@ test "error on trailing operator '2d6+'" {
     try testing.expectError(error.UnexpectedCharacter, result);
 }
 
-test "error on double operator '2d6++5'" {
-    const result = parse("2d6++5");
-    // First + is parsed, then second + is the start of value parsing
-    // which expects a number, but + is not a digit and not followed by digits
-    try testing.expectError(error.UnexpectedCharacter, result);
+test "double operator '2d6++5' parses as an explicitly signed operand" {
+    // parseSigned accepts an optional leading '+', so the second '+' signs the
+    // operand rather than being a stray character. This is not a silent trap:
+    // the rendered label echoes the interpretation back as "2d6+5".
+    const expr = try parse("2d6++5");
+    try testing.expectEqual(@as(usize, 1), expr.operations().len);
+    try testing.expectEqual(Op.add, expr.operations()[0].op);
+    try testing.expectEqual(@as(i32, 5), expr.operations()[0].value.number);
+}
+
+test "negative operand '2d6+-5' subtracts" {
+    const expr = try parse("2d6+-5");
+    try testing.expectEqual(@as(usize, 1), expr.operations().len);
+    try testing.expectEqual(Op.add, expr.operations()[0].op);
+    try testing.expectEqual(@as(i32, -5), expr.operations()[0].value.number);
 }
 
 // -----------------------------------------------------------------------------
@@ -962,7 +910,7 @@ test "error on double operator '2d6++5'" {
 test "parse keep highest '4d6k3'" {
     const result = try parse("4d6k3");
     try expectDiceWithModifier(result.base, 4, 6, .{ .keep_highest = 3 });
-    try testing.expectEqual(@as(usize, 0), result.operations.len);
+    try testing.expectEqual(@as(usize, 0), result.operations().len);
 }
 
 test "parse keep highest '4d6kh3'" {
@@ -1051,41 +999,41 @@ test "parse drop highest '6d8dh2'" {
 test "parse modifier with addition '4d6k3+5'" {
     const result = try parse("4d6k3+5");
     try expectDiceWithModifier(result.base, 4, 6, .{ .keep_highest = 3 });
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 5);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 5);
 }
 
 test "parse modifier with dice addition '4d6k3+1d4'" {
     const result = try parse("4d6k3+1d4");
     try expectDiceWithModifier(result.base, 4, 6, .{ .keep_highest = 3 });
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDice(result.operations[0].value, 1, 4);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDice(result.operations()[0].value, 1, 4);
 }
 
 test "parse modifier in second dice '2d6+4d6k3'" {
     const result = try parse("2d6+4d6k3");
     try expectDice(result.base, 2, 6);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDiceWithModifier(result.operations[0].value, 4, 6, .{ .keep_highest = 3 });
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDiceWithModifier(result.operations()[0].value, 4, 6, .{ .keep_highest = 3 });
 }
 
 test "parse both dice with modifiers '4d6k3+2d20kh1'" {
     const result = try parse("4d6k3+2d20kh1");
     try expectDiceWithModifier(result.base, 4, 6, .{ .keep_highest = 3 });
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectDiceWithModifier(result.operations[0].value, 2, 20, .{ .keep_highest = 1 });
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectDiceWithModifier(result.operations()[0].value, 2, 20, .{ .keep_highest = 1 });
 }
 
 test "parse drop lowest with subtraction '4d6d1-2'" {
     const result = try parse("4d6d1-2");
     try expectDiceWithModifier(result.base, 4, 6, .{ .drop_lowest = 1 });
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.sub, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 2);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.sub, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 2);
 }
 
 // Edge Cases - Keep/Drop All or Maximum
@@ -1216,9 +1164,9 @@ test "parse penetrating with threshold '1d6!p>=5'" {
 test "parse exploding in expression '2d6!+5'" {
     const result = try parse("2d6!+5");
     try expectDiceWithExplode(result.base, 2, 6, .{ .explode_type = .standard, .compare = null }, null);
-    try testing.expectEqual(@as(usize, 1), result.operations.len);
-    try testing.expectEqual(Op.add, result.operations[0].op);
-    try expectNumber(result.operations[0].value, 5);
+    try testing.expectEqual(@as(usize, 1), result.operations().len);
+    try testing.expectEqual(Op.add, result.operations()[0].op);
+    try expectNumber(result.operations()[0].value, 5);
 }
 
 test "parse basic dice has no explode '2d6'" {
@@ -1333,4 +1281,24 @@ test "parse reroll once lte '2d6ro<=2'" {
 test "parse basic dice has no reroll '2d6'" {
     const result = try parse("2d6");
     try testing.expect(result.base.dice.reroll == null);
+}
+
+test "parse accepts operations up to the buffer bound" {
+    // "1" followed by MAX_OPERATIONS "+1" terms.
+    var buf: [4 * (MAX_OPERATIONS + 2)]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try stream.print("1", .{});
+    for (0..MAX_OPERATIONS) |_| try stream.print("+1", .{});
+
+    const expr = try parse(stream.buffered());
+    try testing.expectEqual(@as(usize, MAX_OPERATIONS), expr.operations().len);
+}
+
+test "parse rejects more operations than the buffer holds" {
+    var buf: [4 * (MAX_OPERATIONS + 3)]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    try stream.print("1", .{});
+    for (0..MAX_OPERATIONS + 1) |_| try stream.print("+1", .{});
+
+    try testing.expectError(error.TooManyOperations, parse(stream.buffered()));
 }

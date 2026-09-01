@@ -1,0 +1,14 @@
+.{
+    .name = .toss,
+    .version = "0.5.1",
+    .fingerprint = 0x4b8c6e79d27bed96,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
