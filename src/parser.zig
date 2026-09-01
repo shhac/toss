@@ -531,24 +531,37 @@ const testing = std.testing;
 // Test Helpers
 // -----------------------------------------------------------------------------
 
-fn expectDice(value: ExprValue, expected_count: u32, expected_sides: u32) !void {
+/// Assert the value is a dice term with the given count and sides, returning
+/// the term so callers can go on to check its modifiers.
+fn expectDiceBase(value: ExprValue, expected_count: u32, expected_sides: u32) !DiceRoll {
     try testing.expect(value == .dice);
     try testing.expectEqual(expected_count, value.dice.count);
     try testing.expectEqual(expected_sides, value.dice.sides);
+    return value.dice;
+}
+
+/// Assert an optional matches an expected optional, treating a missing value
+/// where one was expected as a test failure.
+fn expectOptionalEqual(comptime T: type, expected: ?T, actual: ?T) !void {
+    const exp = expected orelse return testing.expect(actual == null);
+    const act = actual orelse return error.TestExpectedEqual;
+    try testing.expectEqual(exp, act);
+}
+
+fn expectComparePoint(expected: ?ComparePoint, actual: ?ComparePoint) !void {
+    const exp = expected orelse return testing.expect(actual == null);
+    const act = actual orelse return error.TestExpectedEqual;
+    try testing.expectEqual(exp.op, act.op);
+    try testing.expectEqual(exp.value, act.value);
+}
+
+fn expectDice(value: ExprValue, expected_count: u32, expected_sides: u32) !void {
+    _ = try expectDiceBase(value, expected_count, expected_sides);
 }
 
 fn expectDiceWithModifier(value: ExprValue, expected_count: u32, expected_sides: u32, expected_keep_drop: ?KeepDrop) !void {
-    try testing.expect(value == .dice);
-    try testing.expectEqual(expected_count, value.dice.count);
-    try testing.expectEqual(expected_sides, value.dice.sides);
-    if (expected_keep_drop) |exp_kd| {
-        const actual_kd = value.dice.keep_drop orelse {
-            return error.TestExpectedEqual;
-        };
-        try testing.expectEqual(exp_kd, actual_kd);
-    } else {
-        try testing.expect(value.dice.keep_drop == null);
-    }
+    const dice = try expectDiceBase(value, expected_count, expected_sides);
+    try expectOptionalEqual(KeepDrop, expected_keep_drop, dice.keep_drop);
 }
 
 fn expectNumber(value: ExprValue, expected: i32) !void {
@@ -557,38 +570,17 @@ fn expectNumber(value: ExprValue, expected: i32) !void {
 }
 
 fn expectDiceWithExplode(value: ExprValue, expected_count: u32, expected_sides: u32, expected_explode: ?ExplodeConfig, expected_keep_drop: ?KeepDrop) !void {
-    try testing.expect(value == .dice);
-    try testing.expectEqual(expected_count, value.dice.count);
-    try testing.expectEqual(expected_sides, value.dice.sides);
+    const dice = try expectDiceBase(value, expected_count, expected_sides);
 
-    // Check explode config
     if (expected_explode) |exp_ex| {
-        const actual_ex = value.dice.explode orelse {
-            return error.TestExpectedEqual;
-        };
+        const actual_ex = dice.explode orelse return error.TestExpectedEqual;
         try testing.expectEqual(exp_ex.explode_type, actual_ex.explode_type);
-        if (exp_ex.compare) |exp_cmp| {
-            const actual_cmp = actual_ex.compare orelse {
-                return error.TestExpectedEqual;
-            };
-            try testing.expectEqual(exp_cmp.op, actual_cmp.op);
-            try testing.expectEqual(exp_cmp.value, actual_cmp.value);
-        } else {
-            try testing.expect(actual_ex.compare == null);
-        }
+        try expectComparePoint(exp_ex.compare, actual_ex.compare);
     } else {
-        try testing.expect(value.dice.explode == null);
+        try testing.expect(dice.explode == null);
     }
 
-    // Check keep/drop
-    if (expected_keep_drop) |exp_kd| {
-        const actual_kd = value.dice.keep_drop orelse {
-            return error.TestExpectedEqual;
-        };
-        try testing.expectEqual(exp_kd, actual_kd);
-    } else {
-        try testing.expect(value.dice.keep_drop == null);
-    }
+    try expectOptionalEqual(KeepDrop, expected_keep_drop, dice.keep_drop);
 }
 
 // -----------------------------------------------------------------------------
@@ -1179,38 +1171,17 @@ test "parse basic dice has no explode '2d6'" {
 // -----------------------------------------------------------------------------
 
 fn expectDiceWithReroll(value: ExprValue, expected_count: u32, expected_sides: u32, expected_reroll: ?RerollConfig, expected_keep_drop: ?KeepDrop) !void {
-    try testing.expect(value == .dice);
-    try testing.expectEqual(expected_count, value.dice.count);
-    try testing.expectEqual(expected_sides, value.dice.sides);
+    const dice = try expectDiceBase(value, expected_count, expected_sides);
 
-    // Check reroll config
     if (expected_reroll) |exp_rr| {
-        const actual_rr = value.dice.reroll orelse {
-            return error.TestExpectedEqual;
-        };
+        const actual_rr = dice.reroll orelse return error.TestExpectedEqual;
         try testing.expectEqual(exp_rr.once, actual_rr.once);
-        if (exp_rr.compare) |exp_cmp| {
-            const actual_cmp = actual_rr.compare orelse {
-                return error.TestExpectedEqual;
-            };
-            try testing.expectEqual(exp_cmp.op, actual_cmp.op);
-            try testing.expectEqual(exp_cmp.value, actual_cmp.value);
-        } else {
-            try testing.expect(actual_rr.compare == null);
-        }
+        try expectComparePoint(exp_rr.compare, actual_rr.compare);
     } else {
-        try testing.expect(value.dice.reroll == null);
+        try testing.expect(dice.reroll == null);
     }
 
-    // Check keep/drop
-    if (expected_keep_drop) |exp_kd| {
-        const actual_kd = value.dice.keep_drop orelse {
-            return error.TestExpectedEqual;
-        };
-        try testing.expectEqual(exp_kd, actual_kd);
-    } else {
-        try testing.expect(value.dice.keep_drop == null);
-    }
+    try expectOptionalEqual(KeepDrop, expected_keep_drop, dice.keep_drop);
 }
 
 test "parse reroll '2d6r1'" {

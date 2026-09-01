@@ -248,16 +248,8 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
 
     // Roll all initial dice
     for (0..dice.count) |i| {
-        const value: u32 = if (dice.sides == 0) blk: {
-            // Fudge dice: -1, 0, or +1 (we store as 0, 1, 2 and interpret later)
-            // For now, just roll 1-3 and subtract 2 for display
-            break :blk rng.roll(3);
-        } else blk: {
-            break :blk rng.roll(dice.sides);
-        };
-
         result._dice_buf[i] = .{
-            .value = value,
+            .value = rollOne(dice, rng),
             .kept = true, // Will be updated by modifier
         };
     }
@@ -271,6 +263,13 @@ fn evaluateDiceRoll(dice: parser.DiceRoll, rng: *rng_mod.Rng) EvalError!DiceRoll
     result.subtotal = result.keptTotal();
 
     return result;
+}
+
+/// Whether a term carries a modifier, which is what makes a total worth showing.
+fn diceHasModifiers(value: parser.ExprValue) bool {
+    if (value != .dice) return false;
+    const dice = value.dice;
+    return dice.keep_drop != null or dice.explode != null or dice.reroll != null;
 }
 
 /// Evaluate an expression value (dice or number), returning the numeric result
@@ -300,13 +299,8 @@ pub fn evaluate(expr: parser.Expr, rng: *rng_mod.Rng) EvalError!RollResult {
     // Evaluate base value
     var total = try evaluateValue(expr.base, rng, &result._rolls_buf, &roll_count);
 
-    // Check if base has keep/drop, explode, or reroll modifiers
-    if (expr.base == .dice and (expr.base.dice.keep_drop != null or expr.base.dice.explode != null or expr.base.dice.reroll != null)) {
-        result.has_modifiers = true;
-    }
-
-    // Has operations means we need to show the total
-    if (expr.operations().len > 0) {
+    // A modifier on any term, or any arithmetic at all, means the total matters.
+    if (diceHasModifiers(expr.base) or expr.operations().len > 0) {
         result.has_modifiers = true;
     }
 
@@ -314,10 +308,7 @@ pub fn evaluate(expr: parser.Expr, rng: *rng_mod.Rng) EvalError!RollResult {
     for (expr.operations()) |op| {
         const operand = try evaluateValue(op.value, rng, &result._rolls_buf, &roll_count);
 
-        // Check if this operand has keep/drop, explode, or reroll modifiers
-        if (op.value == .dice and (op.value.dice.keep_drop != null or op.value.dice.explode != null or op.value.dice.reroll != null)) {
-            result.has_modifiers = true;
-        }
+        if (diceHasModifiers(op.value)) result.has_modifiers = true;
 
         total = switch (op.op) {
             .add => std.math.add(i32, total, operand) catch return error.Overflow,
@@ -509,17 +500,7 @@ test "evaluate exploding dice - no explosion" {
 test "evaluate exploding dice - with explosion" {
     // We need a seed where d6 rolls a 6 to trigger explosion
     // Let's try several seeds and find one that explodes
-    var seed: u64 = 0;
-    var found = false;
-    while (seed < 1000 and !found) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        const val = test_rng.roll(6);
-        if (val == 6) {
-            found = true;
-            break;
-        }
-    }
-    // Now use that seed for the actual test
+    const seed = try seedWhere(1000, rollsMax);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6!");
     const result = try evaluate(expr, &rng);
@@ -534,11 +515,7 @@ test "evaluate exploding dice - with explosion" {
 
 test "evaluate compound exploding" {
     // Find a seed where d6 rolls max to trigger compound explosion
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        if (test_rng.roll(6) == 6) break;
-    }
+    const seed = try seedWhere(1000, rollsMax);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6!!");
     const result = try evaluate(expr, &rng);
@@ -553,11 +530,7 @@ test "evaluate compound exploding" {
 
 test "evaluate penetrating exploding" {
     // Find a seed where d6 rolls max
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        if (test_rng.roll(6) == 6) break;
-    }
+    const seed = try seedWhere(1000, rollsMax);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6!p");
     const result = try evaluate(expr, &rng);
@@ -591,12 +564,7 @@ test "exploding d1 does not explode" {
 test "exploding with compare point" {
     // Test exploding on greater than 4 (so 5 and 6 explode)
     // Find a seed where d6 rolls 5 or 6
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        const val = test_rng.roll(6);
-        if (val > 4) break;
-    }
+    const seed = try seedWhere(1000, rollsAboveFour);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6!>4");
     const result = try evaluate(expr, &rng);
@@ -633,11 +601,7 @@ test "exploding with keep modifier" {
 test "evaluate reroll continuous" {
     // Reroll 1s until we get a non-1
     // We'll find a seed where first roll is 1, so we can verify rerolling happens
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        if (test_rng.roll(6) == 1) break;
-    }
+    const seed = try seedWhere(1000, rollsOne);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6r");
     const result = try evaluate(expr, &rng);
@@ -651,36 +615,21 @@ test "evaluate reroll continuous" {
 test "evaluate reroll once" {
     // Reroll 1s once - even if new value is 1, don't reroll again
     // Find a seed where d6 rolls 1 twice in a row
-    var seed: u64 = 0;
-    var found = false;
-    while (seed < 10000 and !found) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        if (test_rng.roll(6) == 1 and test_rng.roll(6) == 1) {
-            found = true;
-            break;
-        }
-    }
-    if (found) {
-        var rng = rng_mod.Rng.init(std.testing.io, seed);
-        const expr = try parser.parse("1d6ro");
-        const result = try evaluate(expr, &rng);
+    const seed = try seedWhere(10000, rollsOneTwice);
+    var rng = rng_mod.Rng.init(std.testing.io, seed);
+    const expr = try parser.parse("1d6ro");
+    const result = try evaluate(expr, &rng);
 
-        try testing.expectEqual(@as(usize, 1), result.diceRolls().len);
-        try testing.expectEqual(@as(usize, 1), result.diceRolls()[0].diceResults().len);
-        // With ro, we only reroll once, so if both rolls are 1, final value is still 1
-        try testing.expectEqual(@as(u32, 1), result.diceRolls()[0].diceResults()[0].value);
-    }
+    try testing.expectEqual(@as(usize, 1), result.diceRolls().len);
+    try testing.expectEqual(@as(usize, 1), result.diceRolls()[0].diceResults().len);
+    // With ro we reroll only once, so two 1s in a row still leave the die at 1.
+    try testing.expectEqual(@as(u32, 1), result.diceRolls()[0].diceResults()[0].value);
 }
 
 test "evaluate reroll less than" {
     // Reroll values < 3 (i.e., 1 and 2)
     // Find a seed where first roll is 1 or 2
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        const val = test_rng.roll(6);
-        if (val < 3) break;
-    }
+    const seed = try seedWhere(1000, rollsBelowThree);
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6r<3");
     const result = try evaluate(expr, &rng);
@@ -759,11 +708,7 @@ test "evaluate Fudge dice total is sum minus 2 per die" {
 
 test "reroll tracks history" {
     // Find a seed where d6 rolls 1 first (triggering reroll on r1)
-    var seed: u64 = 0;
-    while (seed < 1000) : (seed += 1) {
-        var test_rng = rng_mod.Rng.init(std.testing.io, seed);
-        if (test_rng.roll(6) == 1) break;
-    }
+    const seed = try seedWhere(1000, rollsOne);
 
     var rng = rng_mod.Rng.init(std.testing.io, seed);
     const expr = try parser.parse("1d6r1");
@@ -815,6 +760,34 @@ test "reroll history respects MAX_REROLL_HISTORY cap" {
 // =============================================================================
 // Buffer bounds and RNG-free modifier logic
 // =============================================================================
+
+/// Search for a seed whose opening rolls satisfy `pred`. Fails loudly when no
+/// seed in `bound` matches -- otherwise an exhausted search would leave the
+/// assertions running against a seed that never met the condition.
+fn seedWhere(bound: u64, pred: *const fn (*rng_mod.Rng) bool) !u64 {
+    var seed: u64 = 0;
+    while (seed < bound) : (seed += 1) {
+        var rng = rng_mod.Rng.init(std.testing.io, seed);
+        if (pred(&rng)) return seed;
+    }
+    return error.NoSeedSatisfiesPredicate;
+}
+
+fn rollsMax(rng: *rng_mod.Rng) bool {
+    return rng.roll(6) == 6;
+}
+fn rollsAboveFour(rng: *rng_mod.Rng) bool {
+    return rng.roll(6) > 4;
+}
+fn rollsOne(rng: *rng_mod.Rng) bool {
+    return rng.roll(6) == 1;
+}
+fn rollsBelowThree(rng: *rng_mod.Rng) bool {
+    return rng.roll(6) < 3;
+}
+fn rollsOneTwice(rng: *rng_mod.Rng) bool {
+    return rng.roll(6) == 1 and rng.roll(6) == 1;
+}
 
 fn resultWithValues(values: []const u32) DiceRollResult {
     var result = DiceRollResult{ .subtotal = 0, .sides = 6 };
@@ -899,4 +872,96 @@ test "compound explosions chain and stay marked as exploded" {
     try testing.expectEqual(@as(usize, 1), dice.len);
     try testing.expectEqual(@as(u32, 15), dice[0].value);
     try testing.expect(dice[0].exploded);
+}
+
+// =============================================================================
+// Arithmetic errors and loop-termination caps
+// =============================================================================
+
+fn evalNotation(notation: []const u8, seed: u64) EvalError!RollResult {
+    var rng = rng_mod.Rng.init(std.testing.io, seed);
+    const expr = parser.parse(notation) catch |err|
+        std.debug.panic("test notation '{s}' failed to parse: {t}", .{ notation, err });
+    return evaluate(expr, &rng);
+}
+
+test "evaluate reports division by zero" {
+    try testing.expectError(error.DivisionByZero, evalNotation("1d6/0", 42));
+    try testing.expectError(error.DivisionByZero, evalNotation("10/0", 42));
+}
+
+test "evaluate reports arithmetic overflow" {
+    try testing.expectError(error.Overflow, evalNotation("2147483647+2147483647", 42));
+    try testing.expectError(error.Overflow, evalNotation("-2147483647-2147483647", 42));
+    try testing.expectError(error.Overflow, evalNotation("2147483647*2", 42));
+}
+
+test "evaluate divides truncating toward zero" {
+    const result = try evalNotation("7/2", 42);
+    try testing.expectEqual(@as(i32, 3), result.total);
+}
+
+test "applyExplode stops at the explosion cap" {
+    // Explode on any value: every die qualifies, so only the cap can end this.
+    var rng = rng_mod.Rng.init(std.testing.io, 42);
+    var result = DiceRollResult{ .subtotal = 0, .sides = 6 };
+    result.appendDie(6);
+
+    const always: parser.ExplodeConfig = .{
+        .explode_type = .standard,
+        .compare = .{ .op = .gte, .value = 1 },
+    };
+    applyExplode(&result, .{ .count = 1, .sides = 6 }, always, &rng);
+
+    // Each explosion appends one die, so the run is bounded by MAX_EXPLOSIONS.
+    try testing.expectEqual(@as(usize, MAX_EXPLOSIONS + 1), result._dice_len);
+}
+
+test "applyExplode never exceeds the dice buffer" {
+    var rng = rng_mod.Rng.init(std.testing.io, 42);
+    var result = DiceRollResult{ .subtotal = 0, .sides = 6 };
+    for (0..MAX_DICE) |_| result.appendDie(6);
+    try testing.expectEqual(@as(usize, MAX_DICE), result._dice_len);
+
+    const always: parser.ExplodeConfig = .{
+        .explode_type = .standard,
+        .compare = .{ .op = .gte, .value = 1 },
+    };
+    applyExplode(&result, .{ .count = MAX_DICE, .sides = 6 }, always, &rng);
+
+    // The buffer is already full, so explosions are dropped rather than
+    // overflowing it.
+    try testing.expectEqual(@as(usize, MAX_DICE), result._dice_len);
+}
+
+test "applyReroll stops at the reroll cap" {
+    // Reroll on any value: the cap is the only thing that can end this.
+    var rng = rng_mod.Rng.init(std.testing.io, 42);
+    var result = DiceRollResult{ .subtotal = 0, .sides = 6 };
+    result.appendDie(3);
+
+    const always: parser.RerollConfig = .{ .compare = .{ .op = .gte, .value = 1 } };
+    applyReroll(&result, .{ .count = 1, .sides = 6 }, always, &rng);
+
+    // History is capped well below the reroll cap, so it saturates.
+    try testing.expectEqual(@as(u8, MAX_REROLL_HISTORY), result._dice_buf[0]._reroll_count);
+    try testing.expectEqual(@as(usize, MAX_REROLL_HISTORY), result._dice_buf[0].rerollHistory().len);
+}
+
+test "reroll once replaces a die at most once" {
+    var rng = rng_mod.Rng.init(std.testing.io, 42);
+    var result = DiceRollResult{ .subtotal = 0, .sides = 6 };
+    result.appendDie(1);
+
+    const once: parser.RerollConfig = .{ .once = true, .compare = .{ .op = .gte, .value = 1 } };
+    applyReroll(&result, .{ .count = 1, .sides = 6 }, once, &rng);
+
+    try testing.expectEqual(@as(u8, 1), result._dice_buf[0]._reroll_count);
+}
+
+test "fudge dice never explode" {
+    // Same guard that blocks d1, but for the sides == 0 sentinel.
+    try testing.expect(!shouldExplode(3, 0, .{}));
+    try testing.expect(!shouldExplode(1, 1, .{}));
+    try testing.expect(shouldExplode(6, 6, .{}));
 }

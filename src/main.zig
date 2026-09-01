@@ -36,6 +36,22 @@ fn reportParseError(
     try err_out.flush();
 }
 
+fn reportArgError(
+    err_out: *std.Io.Writer,
+    arg_err: cli.ArgParseError,
+) !void {
+    switch (arg_err) {
+        error.UnknownOption => {
+            try err_out.print("Error: Unknown option\n", .{});
+            try err_out.print("Run 'toss --help' for usage information.\n", .{});
+        },
+        error.MissingSeedValue => try err_out.print("Error: --seed requires a value\n", .{}),
+        error.InvalidSeedValue => try err_out.print("Error: --seed value must be a positive integer\n", .{}),
+        error.OutOfMemory => try err_out.print("Error: Out of memory\n", .{}),
+    }
+    try err_out.flush();
+}
+
 fn reportEvalError(
     err_out: *std.Io.Writer,
     term: std.Io.Terminal,
@@ -104,23 +120,8 @@ fn run(init: std.process.Init) !void {
     };
 
     // Parse arguments
-    const config = cli.parseArgs(allocator, args) catch |parse_err| {
-        switch (parse_err) {
-            error.UnknownOption => {
-                try err_out.print("Error: Unknown option\n", .{});
-                try err_out.print("Run 'toss --help' for usage information.\n", .{});
-            },
-            error.MissingSeedValue => {
-                try err_out.print("Error: --seed requires a value\n", .{});
-            },
-            error.InvalidSeedValue => {
-                try err_out.print("Error: --seed value must be a positive integer\n", .{});
-            },
-            error.OutOfMemory => {
-                try err_out.print("Error: Out of memory\n", .{});
-            },
-        }
-        try err_out.flush();
+    const config = cli.parseArgs(allocator, args) catch |arg_err| {
+        try reportArgError(err_out, arg_err);
         std.process.exit(1);
     };
     defer allocator.free(config.dice_specs);
@@ -165,6 +166,12 @@ fn run(init: std.process.Init) !void {
         .max_label_len = measured.max_label_len,
     };
 
+    const display: render.DisplayOptions = .{
+        .show_rerolls = config.show_rerolls,
+        .no_labels = config.no_labels,
+        .result_only = config.result_only,
+    };
+
     var row_index: usize = 0;
     for (parsed_exprs.items) |expr| {
         const result = eval.evaluate(expr, &rng) catch |eval_err| {
@@ -172,7 +179,7 @@ fn run(init: std.process.Init) !void {
             continue;
         };
         const group = render.color_groups[row_index % render.color_groups.len];
-        try render.renderRow(out, stdout_term, config, group, expr, &result, layout);
+        try render.renderRow(out, stdout_term, display, group, expr, &result, layout);
         row_index += 1;
     }
 

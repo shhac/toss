@@ -3,7 +3,13 @@
 const std = @import("std");
 const parser = @import("parser.zig");
 const eval = @import("eval.zig");
-const cli = @import("cli.zig");
+
+/// The subset of the CLI flags that affects rendering.
+pub const DisplayOptions = struct {
+    show_rerolls: bool = false,
+    no_labels: bool = false,
+    result_only: bool = false,
+};
 
 /// Upper bound on a rendered expression label such as "[4d6k3]".
 pub const MAX_LABEL_LEN = 128;
@@ -43,6 +49,20 @@ fn fudgeDisplay(value: u32) []const u8 {
     };
 }
 
+/// Explode points spell out `=N`; reroll points write a bare `N`.
+const EqStyle = enum { explicit_eq, bare_eq };
+
+fn formatComparePoint(writer: *std.Io.Writer, cmp: parser.ComparePoint, eq_style: EqStyle) !void {
+    const prefix: []const u8 = switch (cmp.op) {
+        .eq => if (eq_style == .explicit_eq) "=" else "",
+        .gt => ">",
+        .lt => "<",
+        .gte => ">=",
+        .lte => "<=",
+    };
+    try writer.print("{s}{d}", .{ prefix, cmp.value });
+}
+
 /// Format an expression for display (reconstructs the original notation)
 pub fn formatExpr(writer: *std.Io.Writer, expr: parser.Expr) !void {
     try formatExprValue(writer, expr.base);
@@ -76,16 +96,7 @@ fn formatExprValue(writer: *std.Io.Writer, value: parser.ExprValue) !void {
                     .compound => try writer.print("!!", .{}),
                     .penetrating => try writer.print("!p", .{}),
                 }
-                // Format compare point if present
-                if (ex.compare) |cmp| {
-                    switch (cmp.op) {
-                        .eq => try writer.print("={d}", .{cmp.value}),
-                        .gt => try writer.print(">{d}", .{cmp.value}),
-                        .lt => try writer.print("<{d}", .{cmp.value}),
-                        .gte => try writer.print(">={d}", .{cmp.value}),
-                        .lte => try writer.print("<={d}", .{cmp.value}),
-                    }
-                }
+                if (ex.compare) |cmp| try formatComparePoint(writer, cmp, .explicit_eq);
             }
             // Format reroll modifier (r, ro)
             if (dice.reroll) |rr| {
@@ -94,16 +105,7 @@ fn formatExprValue(writer: *std.Io.Writer, value: parser.ExprValue) !void {
                 } else {
                     try writer.writeByte('r');
                 }
-                // Format compare point if present
-                if (rr.compare) |cmp| {
-                    switch (cmp.op) {
-                        .eq => try writer.print("{d}", .{cmp.value}),
-                        .gt => try writer.print(">{d}", .{cmp.value}),
-                        .lt => try writer.print("<{d}", .{cmp.value}),
-                        .gte => try writer.print(">={d}", .{cmp.value}),
-                        .lte => try writer.print("<={d}", .{cmp.value}),
-                    }
-                }
+                if (rr.compare) |cmp| try formatComparePoint(writer, cmp, .bare_eq);
             }
             if (dice.keep_drop) |kd| {
                 switch (kd) {
@@ -147,7 +149,7 @@ pub fn labelWidth(expr: parser.Expr) usize {
 fn renderDie(
     out: *std.Io.Writer,
     term: std.Io.Terminal,
-    config: cli.Config,
+    opts: DisplayOptions,
     die: eval.DieResult,
     is_fudge: bool,
     color: std.Io.Terminal.Color,
@@ -167,13 +169,13 @@ fn renderDie(
 
     term.setColor(.reset) catch {};
     term.setColor(color) catch {};
-    if (config.show_rerolls and die._reroll_count > 0) {
+    if (opts.show_rerolls and die._reroll_count > 0) {
         for (die.rerollHistory()) |hist_val| {
             try out.print("{d},", .{hist_val});
         }
     }
     // Labels are what the columns align to, so drop the padding without them.
-    const width: usize = if (config.no_labels) 0 else layout.sides_width;
+    const width: usize = if (opts.no_labels) 0 else layout.sides_width;
     if (is_fudge) {
         try out.print("{s:[1]}", .{ fudgeDisplay(die.value), width });
     } else {
@@ -186,13 +188,13 @@ fn renderDie(
 pub fn renderRow(
     out: *std.Io.Writer,
     term: std.Io.Terminal,
-    config: cli.Config,
+    opts: DisplayOptions,
     group: ColorGroup,
     expr: parser.Expr,
     result: *const eval.RollResult,
     layout: Layout,
 ) !void {
-    if (config.result_only) {
+    if (opts.result_only) {
         term.setColor(.bold) catch {};
         try out.print("{d}", .{result.total});
         term.setColor(.reset) catch {};
@@ -200,7 +202,7 @@ pub fn renderRow(
         return;
     }
 
-    if (!config.no_labels) {
+    if (!opts.no_labels) {
         var label_buf: [MAX_LABEL_LEN]u8 = undefined;
         var label_stream: std.Io.Writer = .fixed(&label_buf);
         try formatExpr(&label_stream, expr);
@@ -217,9 +219,9 @@ pub fn renderRow(
     for (result.diceRolls()) |dice_result| {
         for (dice_result.diceResults()) |die| {
             // Without labels the first die opens the line, so it needs no separator.
-            if (die_index > 0 or !config.no_labels) try out.print(" ", .{});
+            if (die_index > 0 or !opts.no_labels) try out.print(" ", .{});
             const color = group.results[die_index % group.results.len];
-            try renderDie(out, term, config, die, dice_result.sides == 0, color, layout);
+            try renderDie(out, term, opts, die, dice_result.sides == 0, color, layout);
             die_index += 1;
         }
     }
@@ -311,4 +313,123 @@ test "labelWidth matches the rendered label length" {
     try testing.expectEqual(@as(usize, 3), labelWidth(try parser.parse("2d6")));
     try testing.expectEqual(@as(usize, 5), labelWidth(try parser.parse("4d6k3")));
     try testing.expectEqual(@as(usize, 5), labelWidth(try parser.parse("1d100")));
+}
+
+// =============================================================================
+// Rendered output
+// =============================================================================
+
+const TestDie = struct {
+    value: u32,
+    kept: bool = true,
+    exploded: bool = false,
+    rerolls: []const u32 = &.{},
+};
+
+/// Build a single-roll result without going through the RNG, so rendering can
+/// be asserted against exact strings.
+fn rollResultWith(sides: u32, dice: []const TestDie, has_modifiers: bool) eval.RollResult {
+    var roll = eval.DiceRollResult{ .subtotal = 0, .sides = sides };
+    for (dice) |d| {
+        var die = eval.DieResult{ .value = d.value, .kept = d.kept, .exploded = d.exploded };
+        for (d.rerolls) |r| {
+            die._reroll_history[die._reroll_count] = r;
+            die._reroll_count += 1;
+        }
+        roll._dice_buf[roll._dice_len] = die;
+        roll._dice_len += 1;
+    }
+    roll.subtotal = roll.keptTotal();
+
+    var result = eval.RollResult{ .total = roll.subtotal, .has_modifiers = has_modifiers };
+    result._rolls_buf[0] = roll;
+    result._rolls_len = 1;
+    return result;
+}
+
+fn expectRendered(
+    expected: []const u8,
+    notation: []const u8,
+    sides: u32,
+    dice: []const TestDie,
+    has_modifiers: bool,
+    opts: DisplayOptions,
+    layout: Layout,
+) !void {
+    var buf: [512]u8 = undefined;
+    var stream: std.Io.Writer = .fixed(&buf);
+    const term: std.Io.Terminal = .{ .writer = &stream, .mode = .no_color };
+
+    const expr = try parser.parse(notation);
+    const result = rollResultWith(sides, dice, has_modifiers);
+    try renderRow(&stream, term, opts, color_groups[0], expr, &result, layout);
+    try testing.expectEqualStrings(expected, stream.buffered());
+}
+
+const wide: Layout = .{ .sides_width = 1, .max_label_len = 5 };
+
+test "renderRow pads the label with underscores to the widest label" {
+    try expectRendered("[__2d6] 3 4\n", "2d6", 6, &.{ .{ .value = 3 }, .{ .value = 4 } }, false, .{}, wide);
+}
+
+test "renderRow marks dropped dice with tildes" {
+    try expectRendered(
+        "[_4d6k3] 6 5 4 ~1~ = 15\n",
+        "4d6k3",
+        6,
+        &.{ .{ .value = 6 }, .{ .value = 5 }, .{ .value = 4 }, .{ .value = 1, .kept = false } },
+        true,
+        .{},
+        .{ .sides_width = 1, .max_label_len = 6 },
+    );
+}
+
+test "renderRow marks exploded dice with an asterisk" {
+    try expectRendered(
+        "[_1d6!] 6* 3 = 9\n",
+        "1d6!",
+        6,
+        &.{ .{ .value = 6, .exploded = true }, .{ .value = 3 } },
+        true,
+        .{},
+        .{ .sides_width = 1, .max_label_len = 5 },
+    );
+}
+
+test "renderRow shows reroll history only when asked" {
+    const dice = &[_]TestDie{.{ .value = 5, .rerolls = &.{ 1, 2 } }};
+    try expectRendered("[_2d6r1] 1,2,5 = 5\n", "2d6r1", 6, dice, true, .{ .show_rerolls = true }, .{ .sides_width = 1, .max_label_len = 6 });
+    try expectRendered("[_2d6r1] 5 = 5\n", "2d6r1", 6, dice, true, .{}, .{ .sides_width = 1, .max_label_len = 6 });
+}
+
+test "renderRow right-aligns dice to the widest die" {
+    try expectRendered(
+        "[1d100]   7  61\n",
+        "1d100",
+        100,
+        &.{ .{ .value = 7 }, .{ .value = 61 } },
+        false,
+        .{},
+        .{ .sides_width = 3, .max_label_len = 5 },
+    );
+}
+
+test "renderRow renders fudge dice as -1, 0, +1" {
+    try expectRendered(
+        "[__3dF] -1  0 +1\n",
+        "3dF",
+        0,
+        &.{ .{ .value = 1 }, .{ .value = 2 }, .{ .value = 3 } },
+        false,
+        .{},
+        .{ .sides_width = 2, .max_label_len = 5 },
+    );
+}
+
+test "renderRow with no_labels omits the label and the padding" {
+    try expectRendered("3 4\n", "2d6", 6, &.{ .{ .value = 3 }, .{ .value = 4 } }, false, .{ .no_labels = true }, wide);
+}
+
+test "renderRow with result_only prints just the total" {
+    try expectRendered("7\n", "2d6", 6, &.{ .{ .value = 3 }, .{ .value = 4 } }, true, .{ .result_only = true }, wide);
 }
