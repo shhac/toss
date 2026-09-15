@@ -127,11 +127,14 @@ jobs:
           SHA_MACOS_X86=$(sha x86_64-macos)
           SHA_LINUX_ARM=$(sha aarch64-linux-gnu)
           SHA_LINUX_X86=$(sha x86_64-linux-gnu)
+          # No `version` stanza in the formula: Homebrew scans it from the URLs
+          # below, and an explicit one that agrees is a `brew audit` offence
+          # ("redundant with version scanned from URL"). The test block still
+          # pins ${VERSION}, so a mis-scanned version would fail `brew test`.
           cat > toss.rb <<EOF
           class Toss < Formula
             desc "Fast dice rolling CLI with colored output and reproducible rolls"
             homepage "https://github.com/shhac/toss"
-            version "${VERSION}"
             license "MIT"
 
             on_macos do
